@@ -46,6 +46,9 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
+        // 这个窗口我们自己在 current 里留着强引用，不能再让 AppKit 关窗时替我们 release 一次
+        // （默认 true，多出来的那次 release 会在后面的自动释放池里炸成 EXC_BAD_ACCESS）
+        window.isReleasedWhenClosed = false
         window.delegate = self
         window.standardWindowButton(.zoomButton)?.isHidden = true
         window.standardWindowButton(.miniaturizeButton)?.isHidden = true
