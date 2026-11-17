@@ -3,10 +3,17 @@ import Foundation
 
 /// 数据目录。不挂在 UpdateService 上：Cask 枚举在后台并发 Task 里要用它，
 /// 而 UpdateService 是 @MainActor 隔离的（Swift 6 语言模式下会硬报错）。
-let URSupportDir: URL = {
+let SentrySupportDir: URL = {
     let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-    let dir = base.appendingPathComponent("UpdateRadar", isDirectory: true)
-    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let dir = base.appendingPathComponent("Sentry", isDirectory: true)
+    let fm = FileManager.default
+    // 从「更新雷达」改名为 Sentry：首次启动把旧数据目录整个搬过来，
+    // 保住已有的配置、忽略列表和缓存，用户不会丢设置。只在旧目录在、新目录不在时搬一次。
+    let legacy = base.appendingPathComponent("UpdateRadar", isDirectory: true)
+    if !fm.fileExists(atPath: dir.path), fm.fileExists(atPath: legacy.path) {
+        try? fm.moveItem(at: legacy, to: dir)
+    }
+    try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
     return dir
 }()
 

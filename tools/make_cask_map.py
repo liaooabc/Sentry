@@ -58,7 +58,7 @@ def bundles_of(cask):
 def main():
     print("▸ 下载 Homebrew Cask 索引（约 2MB 压缩传输）…")
     req = urllib.request.Request(URL, headers={"Accept-Encoding": "gzip",
-                                              "User-Agent": "UpdateRadar/1.x"})
+                                              "User-Agent": "Sentry/1.x"})
     with urllib.request.urlopen(req, timeout=600) as r:
         raw = r.read()
         if r.headers.get("Content-Encoding") == "gzip":

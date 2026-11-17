@@ -62,7 +62,7 @@ struct VersionTests {
     }
 
     static func stateReport() {
-        let path = NSHomeDirectory() + "/Library/Application Support/UpdateRadar/state.json"
+        let path = NSHomeDirectory() + "/Library/Application Support/Sentry/state.json"
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let results = obj["results"] as? [String: [String: Any]] else {

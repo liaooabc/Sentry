@@ -2,7 +2,7 @@ import AppKit
 import Combine
 import Foundation
 
-/// 「更新雷达」自己的更新。别人的 App 更新靠检测源，它自己的更新靠 GitHub Release：
+/// 「Sentry」自己的更新。别人的 App 更新靠检测源，它自己的更新靠 GitHub Release：
 /// 仓库的 latest release 就是唯一可信来源，tag 是版本号，assets 里是 DMG。
 ///
 /// 装新版的做法（Sparkle 那套的精简版）：下载 DMG → 挂载 → 校验包 → ditto 到暂存区 →
@@ -20,7 +20,10 @@ final class SelfUpdater: ObservableObject {
         case failed(String)
     }
 
-    static let repo = "liaooabc/UpdateRadar"
+    static let repo = "liaooabc/Sentry"
+    /// 改名前的旧 bundle id。允许旧用户从「更新雷达」直接更新到 Sentry，
+    /// 校验时不因 bundle id 变了而拒绝。
+    static let legacyBundleIDs: Set<String> = ["com.hushixiong.updateradar"]
 
     @Published private(set) var phase: Phase = .idle
     private var lastChecked: Date?
@@ -136,7 +139,7 @@ final class SelfUpdater: ObservableObject {
             throw UpdateError("没有权限写入 \(targetDir.path)。请把 App 拖进「应用程序」文件夹，或手动下载安装。")
         }
 
-        let mount = fm.temporaryDirectory.appendingPathComponent("urmount-\(UUID().uuidString.prefix(8))")
+        let mount = fm.temporaryDirectory.appendingPathComponent("sentrymount-\(UUID().uuidString.prefix(8))")
         try fm.createDirectory(at: mount, withIntermediateDirectories: true)
         defer { try? Self.run("/usr/bin/hdiutil", ["detach", mount.path, "-force"]) }
 
@@ -147,8 +150,10 @@ final class SelfUpdater: ObservableObject {
             throw UpdateError("下载的 DMG 里没有找到 App，可能下载到了错误的文件。")
         }
         guard let bundle = Bundle(url: newApp),
-              bundle.bundleIdentifier == Bundle.main.bundleIdentifier else {
-            throw UpdateError("下载的 App 不是更新雷达（bundle id 对不上），已中止。")
+              let downloadedID = bundle.bundleIdentifier,
+              let currentID = Bundle.main.bundleIdentifier,
+              downloadedID == currentID || Self.legacyBundleIDs.contains(downloadedID) else {
+            throw UpdateError("下载的 App 不是 Sentry（bundle id 对不上），已中止。")
         }
         let gotVersion = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
         guard Ver.compare(gotVersion, expectedVersion) != .orderedAscending else {
@@ -156,20 +161,20 @@ final class SelfUpdater: ObservableObject {
         }
 
         // 暂存（拷出来，DMG 就可以卸了）
-        let stagingDir = URSupportDir.appendingPathComponent("Update", isDirectory: true)
+        let stagingDir = SentrySupportDir.appendingPathComponent("Update", isDirectory: true)
         try? fm.removeItem(at: stagingDir)
         try fm.createDirectory(at: stagingDir, withIntermediateDirectories: true)
-        let staging = stagingDir.appendingPathComponent("更新雷达.app")
+        let staging = stagingDir.appendingPathComponent("Sentry.app")
         try Self.run("/usr/bin/ditto", [newApp.path, staging.path])
         try Self.verifySignature(of: staging)
         try? fm.removeItem(at: dmg)
 
         // 替换脚本：等本进程退出 → 备份 → 放新包 → 重新打开；任何一步失败都回滚并重新打开旧的
         let backup = stagingDir.appendingPathComponent("旧版备份.app")
-        let script = fm.temporaryDirectory.appendingPathComponent("ur-update-\(UUID().uuidString.prefix(8)).sh")
+        let script = fm.temporaryDirectory.appendingPathComponent("sentry-update-\(UUID().uuidString.prefix(8)).sh")
         let body = """
         #!/bin/bash
-        # 更新雷达自动替换脚本（App 退出后执行）
+        # Sentry 自动替换脚本（App 退出后执行）
         APP="$1"; NEW="$2"; BACKUP="$3"; PID="$4"
         n=0
         while /bin/kill -0 "$PID" 2>/dev/null; do
@@ -266,7 +271,7 @@ final class SelfUpdater: ObservableObject {
                         didFinishDownloadingTo location: URL) {
             // 这个方法返回后临时文件就没了，必须当场搬走
             let dest = FileManager.default.temporaryDirectory
-                .appendingPathComponent("更新雷达-\(UUID().uuidString.prefix(8)).dmg")
+                .appendingPathComponent("Sentry-\(UUID().uuidString.prefix(8)).dmg")
             do {
                 try FileManager.default.moveItem(at: location, to: dest)
                 continuation?.resume(returning: dest)

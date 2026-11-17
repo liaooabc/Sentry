@@ -7,12 +7,12 @@
 一、先在网页上建仓库（只做一次）
 --------------------------------
 1. 浏览器打开 https://github.com/new
-2. Repository name 填：UpdateRadar
+2. Repository name 填：Sentry
 3. 下面三个勾（Add a README / .gitignore / license）都不用勾
 4. 点绿色的 Create repository
 
 建完那个页面就是你的仓库地址，形如：
-    https://github.com/你的用户名/UpdateRadar
+    https://github.com/你的用户名/Sentry
 
 
 二、拿一个「令牌」（只做一次，相当于给脚本的钥匙）
@@ -20,9 +20,9 @@
 1. 右上角头像 → Settings
 2. 左边拉到最下面 → Developer settings
 3. Personal access tokens → Fine-grained tokens → Generate new token
-4. Token name 随便写（例如 更新雷达发布）
+4. Token name 随便写（例如 Sentry 发布）
 5. Expiration 选 1 year（到期再换一个）
-6. Repository access：选 All repositories，或者 Only select repositories 里勾上 UpdateRadar
+6. Repository access：选 All repositories，或者 Only select repositories 里勾上 Sentry
 7. Permissions → Repository permissions：
       Contents       → Read and write   （推源码、传安装包都靠它）
       Releases       → Read and write
@@ -32,14 +32,14 @@
 
 三、把信息填进去（只做一次）
 ----------------------------
-在「文稿/更新雷达」里双击「发布到GitHub.command」，
+在「文稿/Sentry」里双击「发布到GitHub.command」，
 它会自动打开一个配置文件，长这样：
 
     OWNER=你的GitHub用户名
-    REPO=UpdateRadar
+    REPO=Sentry
 
 把 OWNER 换成你的用户名，保存、关掉文本窗口，再双击一次就行。
-配置文件存在 ~/.config/更新雷达/github.cfg，只有你自己能读（权限 600）。
+配置文件存在 ~/.config/Sentry/github.cfg，只有你自己能读（权限 600）。
 
 令牌不用写进配置文件了：第二次双击时脚本会问你要一次（输入不显示），
 拿到就存进 macOS 登录钥匙串（服务 github.com、账号 x-access-token）。
@@ -54,7 +54,7 @@
 2. 双击「发布到GitHub.command」 → 源码推上去 + DMG 传到 Releases
 
 完事会打印两个地址：
-   发布页  https://github.com/你的用户名/UpdateRadar/releases/tag/v1.0.2
+   发布页  https://github.com/你的用户名/Sentry/releases/tag/v1.0.2
    下载直链（会同时复制到剪贴板，写文章直接粘）
 
 
@@ -88,11 +88,11 @@
 不用令牌也能把源码发上去：
 
 1. 打开 GitHub Desktop → 左上下拉菜单里 Sign in → 浏览器里点授权
-2. File → Add local repository… → 选「文稿/更新雷达」
+2. File → Add local repository… → 选「文稿/Sentry」
    （它已经是 git 仓库了，会被认出来）
-3. 右上角出现 Publish repository → 名字填 UpdateRadar
+3. 右上角出现 Publish repository → 名字填 Sentry
    → 把「Keep this code private」的勾取消（想私有就留着）→ Publish repository
-4. 完事源码就在 https://github.com/你的用户名/UpdateRadar
+4. 完事源码就在 https://github.com/你的用户名/Sentry
 
 源码这步以后用 Desktop 点两下就行。但 **GitHub Desktop 不会发 Release（安装包）**，
 安装包还是二选一：

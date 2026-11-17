@@ -56,10 +56,10 @@ final class LaunchAtLogin: ObservableObject {
         let raw = error.localizedDescription
         let path = Bundle.main.bundlePath
         if path.contains("AppTranslocation") {
-            return "请先把「更新雷达」拖进「应用程序」文件夹，再打开这个开关。"
+            return "请先把「Sentry」拖进「应用程序」文件夹，再打开这个开关。"
         }
         if turningOn, !path.hasPrefix("/Applications/") {
-            return "请先把「更新雷达」放到「应用程序」文件夹（现在在 \(path)）。"
+            return "请先把「Sentry」放到「应用程序」文件夹（现在在 \(path)）。"
         }
         return raw.isEmpty ? "无法更改登录项，请到「系统设置 → 通用 → 登录项」里手动处理。" : raw
     }

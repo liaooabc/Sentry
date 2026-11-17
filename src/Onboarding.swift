@@ -42,7 +42,7 @@ final class OnboardingWindow: NSObject, NSWindowDelegate {
                           styleMask: [.titled, .closable, .fullSizeContentView],
                           backing: .buffered, defer: false)
         super.init()
-        window.title = "欢迎使用更新雷达"
+        window.title = "欢迎使用 Sentry"
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
@@ -149,7 +149,7 @@ private struct OnboardingView: View {
                 .interpolation(.high)
                 .frame(width: 84, height: 84)
 
-            Text("更新雷达")
+            Text("Sentry")
                 .font(.system(size: 26, weight: .semibold))
                 .padding(.top, 16)
 

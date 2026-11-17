@@ -4,9 +4,9 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 
-CFG_DIR="${HOME}/.config/更新雷达"
+CFG_DIR="${HOME}/.config/Sentry"
 CFG="${CFG_DIR}/github.cfg"
-DMG="dist/更新雷达-$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)-arm64.dmg"
+DMG="dist/Sentry-$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)-arm64.dmg"
 
 say() { echo "$1"; }
 
@@ -16,7 +16,7 @@ if [ ! -f "${CFG}" ]; then
     cat > "${CFG}" <<'EOF'
 # 填两行，保存关掉窗口，再双击一次「发布到GitHub.command」
 OWNER=你的GitHub用户名
-REPO=UpdateRadar
+REPO=Sentry
 # 令牌不用写在这个文件里：脚本会把它存进 macOS 钥匙串
 #   （服务 github.com，账号 x-access-token），remote 地址里也不会带令牌
 # 生成令牌：GitHub → 右上角头像 → Settings → Developer settings
@@ -102,7 +102,7 @@ git remote add origin "https://x-access-token@github.com/${OWNER}/${REPO}.git"
 git branch -M main >/dev/null 2>&1 || true
 git add -A >/dev/null 2>&1
 git -c user.name="${OWNER}" -c user.email="${OWNER}@users.noreply.github.com" \
-    commit -qm "更新雷达 ${VER}" >/dev/null 2>&1 || true
+    commit -qm "Sentry ${VER}" >/dev/null 2>&1 || true
 if git push -u origin main >/tmp/radar-push.log 2>&1; then
     say "  源码已推送：https://github.com/${OWNER}/${REPO}"
 else
@@ -129,7 +129,7 @@ BODY_FILE="$(mktemp)"
 if [ -f "发布说明.md" ]; then
     cat "发布说明.md" > "${BODY_FILE}"
 else
-    printf '## 更新雷达 %s（Apple 芯片）\n' "${VER}" > "${BODY_FILE}"
+    printf '## Sentry %s（Apple 芯片）\n' "${VER}" > "${BODY_FILE}"
 fi
 JSON_FILE="$(mktemp)"
 python3 - "${TAG}" "${VER}" "${BODY_FILE}" "${JSON_FILE}" <<'PY'
@@ -138,7 +138,7 @@ tag, ver, body_file, out_file = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[
 with open(body_file, encoding="utf-8") as f:
     body = f.read()
 with open(out_file, "w", encoding="utf-8") as f:
-    json.dump({"tag_name": tag, "name": f"更新雷达 {ver}", "body": body,
+    json.dump({"tag_name": tag, "name": f"Sentry {ver}", "body": body,
                "draft": False, "prerelease": False}, f, ensure_ascii=False)
 PY
 RESP=$(curl -sS -X POST "${API}/releases" \
@@ -170,7 +170,7 @@ fi
 
 # ── 3. 传安装包 ──────────────────────────────────────────
 say "▸ 3/3 上传安装包"
-ASSET="UpdateRadar-${VER}-arm64.dmg"
+ASSET="Sentry-${VER}-arm64.dmg"
 curl -sS -X POST "${UP}?name=${ASSET}" \
     -H "Authorization: Bearer ${TOKEN}" \
     -H "Accept: application/vnd.github+json" \

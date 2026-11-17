@@ -31,7 +31,7 @@ DMG=$(ls -t dist/*.dmg | head -1)
 echo "搞定。新的安装包："
 echo "  $DMG"
 echo
-echo "接下来：双击打开它 → 把「更新雷达」拖进 Applications → 就能发给别人了。"
+echo "接下来：双击打开它 → 把「Sentry」拖进 Applications → 就能发给别人了。"
 open "$(dirname "$DMG")"
 echo
 read -n 1 -s -r -p "按任意键关闭窗口"

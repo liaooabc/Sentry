@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 22 22">
   <!--
-    更新雷达 · 菜单栏图标（template image）
+    Sentry · 菜单栏图标（template image）
 
     菜单栏走 template 渲染：只保留 alpha，系统按菜单栏明暗自动反色。
     因此不需要明暗双模，只需这一份单色剪影。

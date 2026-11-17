@@ -3,21 +3,21 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>更新雷达</string>
+	<string>Sentry</string>
 	<key>CFBundleExecutable</key>
-	<string>UpdateRadar</string>
+	<string>Sentry</string>
 	<key>CFBundleIconName</key>
 	<string>AppIcon37</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.hushixiong.updateradar</string>
+	<string>com.hushixiong.sentry</string>
 	<key>CFBundleName</key>
-	<string>更新雷达</string>
+	<string>Sentry</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.4.3</string>
+	<string>1.5.0</string>
 	<key>CFBundleVersion</key>
-	<string>46</string>
+	<string>47</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>15.0</string>
 	<key>LSUIElement</key>
@@ -25,6 +25,6 @@
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
-	<string>© 2026 更新雷达 · 保留所有权利</string>
+	<string>© 2026 Sentry · 保留所有权利</string>
 </dict>
 </plist>

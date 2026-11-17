@@ -5,11 +5,11 @@ private let warnAmber = Color.orange
 
 extension Notification.Name {
     /// ⌘F：菜单栏点「搜索」后，让搜索框成为第一响应者
-    static let updateRadarFocusSearch = Notification.Name("UpdateRadarFocusSearch")
+    static let updateRadarFocusSearch = Notification.Name("SentryFocusSearch")
     /// 从外面改写搜索框内容（点清除按钮、点最近搜索里的一条）。
     /// 必须走通知：NSTextField 正在编辑时，SwiftUI 的 binding 回写到不了编辑器里，
     /// 不清掉编辑器里的字，界面就会和 ui.query 对不上。
-    static let updateRadarSetSearch = Notification.Name("UpdateRadarSetSearch")
+    static let updateRadarSetSearch = Notification.Name("SentrySetSearch")
 
     /// 点更新通知后传过来的 App id：列表翻到「可更新」并定位到那一行。
     static let urRevealRow = Notification.Name("URRevealRow")
@@ -299,7 +299,7 @@ struct ContentView: View {
                 ui.showSettings = false
                 ui.showAbout = true
             }
-            footerButton("power", help: "退出更新雷达") { onQuit() }
+            footerButton("power", help: "退出 Sentry") { onQuit() }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -315,7 +315,7 @@ struct ContentView: View {
                     .resizable()
                     .frame(width: 72, height: 72)
 
-                Text("更新雷达")
+                Text("Sentry")
                     .font(.system(size: 16, weight: .semibold))
                     .padding(.top, 2)
 
@@ -420,7 +420,7 @@ struct ContentView: View {
                 if ui.aboutFromSettings { ui.showSettings = true }
             }
             Spacer(minLength: 0)
-            footerButton("power", help: "退出更新雷达") { onQuit() }
+            footerButton("power", help: "退出 Sentry") { onQuit() }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -449,7 +449,7 @@ struct ContentView: View {
 
     private var appCopyright: String {
         Bundle.main.object(forInfoDictionaryKey: "NSHumanReadableCopyright") as? String
-            ?? "© 2026 更新雷达 · 保留所有权利"
+            ?? "© 2026 Sentry · 保留所有权利"
     }
 
     /// 反馈邮件入口：收件人、标题、版本和系统版本都预填好，用户只补问题描述。
@@ -460,7 +460,7 @@ struct ContentView: View {
         mail.scheme = "mailto"
         mail.path = "2598492427@qq.com"
         mail.queryItems = [
-            URLQueryItem(name: "subject", value: "更新雷达反馈（版本 \(updater.currentVersion)）"),
+            URLQueryItem(name: "subject", value: "Sentry 反馈（版本 \(updater.currentVersion)）"),
             URLQueryItem(name: "body",
                          value: "\n\n\n——\n版本：\(version)\nmacOS：\(ProcessInfo.processInfo.operatingSystemVersionString)")
         ]
@@ -474,7 +474,7 @@ struct ContentView: View {
     }
 
     private var githubIssues: URL {
-        URL(string: "https://github.com/liaooabc/UpdateRadar/issues")!
+        URL(string: "https://github.com/liaooabc/Sentry/issues")!
     }
 
     /// 有新版本时，关于页的版本行改显示「发布说明」，顺带把安装行一起露出来
@@ -758,7 +758,7 @@ struct ContentView: View {
                 ui.showAbout = true
             }
             footerButton("gearshape", help: "设置") { ui.showSettings = true }
-            footerButton("power", help: "退出更新雷达") { onQuit() }
+            footerButton("power", help: "退出 Sentry") { onQuit() }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)

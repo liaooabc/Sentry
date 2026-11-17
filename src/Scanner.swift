@@ -2,7 +2,7 @@ import AppKit
 import Foundation
 
 enum Scanner {
-    static let selfBundleId = "com.hushixiong.updateradar"
+    static let selfBundleId = "com.hushixiong.sentry"
 
     static func scan() -> [InstalledApp] {
         var roots = ["/Applications"]

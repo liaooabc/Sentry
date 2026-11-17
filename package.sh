@@ -6,14 +6,14 @@ cd "$ROOT"
 
 VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$ROOT/Info.plist")
 OUT="$ROOT/dist"
-DMG_NAME="更新雷达-${VERSION}-arm64.dmg"
+DMG_NAME="Sentry-${VERSION}-arm64.dmg"
 
 echo "▸ 1/4 构建"
 "$ROOT/build.sh"
 
 echo "▸ 2/4 组装"
 STAGE="$(mktemp -d)"
-cp -R "$ROOT/build/更新雷达.app" "$STAGE/"
+cp -R "$ROOT/build/Sentry.app" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
 if [ -f "$ROOT/安装说明.txt" ]; then
     cp "$ROOT/安装说明.txt" "$STAGE/"
@@ -22,7 +22,7 @@ fi
 echo "▸ 3/4 生成 DMG"
 mkdir -p "$OUT"
 rm -f "$OUT/$DMG_NAME"
-hdiutil create -volname "更新雷达 $VERSION" -srcfolder "$STAGE" -ov -format UDZO \
+hdiutil create -volname "Sentry $VERSION" -srcfolder "$STAGE" -ov -format UDZO \
     -fs HFS+ "$OUT/$DMG_NAME" >/dev/null 2>&1
 rm -rf "$STAGE"
 

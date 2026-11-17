@@ -1,5 +1,5 @@
 #!/bin/bash
-# 更新雷达 构建脚本：编译 → 生成日夜图标资源 → 打包 .app → 临时签名
+# Sentry 构建脚本：编译 → 生成日夜图标资源 → 打包 .app → 临时签名
 set -euo pipefail
 # 这台机器装过 Xcode.app 但没同意许可：swiftc 用 Command Line Tools，
 # actool（编译资源目录）只有 Xcode 里那份能用。
@@ -8,7 +8,7 @@ export XCODE_DEV=/Applications/Xcode.app
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 SRC="$ROOT/src"
 BUILD="$ROOT/build"
-APP="$BUILD/更新雷达.app"
+APP="$BUILD/Sentry.app"
 
 echo "▸ 并发自检（Swift 6 迁移债，看这个数就行）"
 CONC_LOG="$(mktemp)"
@@ -33,7 +33,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 echo "▸ 编译（约 1-2 分钟）"
 DEVELOPER_DIR="$CLT_DEV" swiftc -O -whole-module-optimization \
     -target arm64-apple-macosx15.0 \
-    -o "$APP/Contents/MacOS/UpdateRadar" \
+    -o "$APP/Contents/MacOS/Sentry" \
     "$SRC"/*.swift
 
 echo "▸ 图标（Icon Composer 图层包：圆环 + 箭头，白天白底黑图 / 暗夜黑底白图）"

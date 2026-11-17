@@ -31,8 +31,8 @@ final class UpdateService: ObservableObject {
     /// 结果重绘节流
     private var pendingRebuild: DispatchWorkItem?
 
-    // 真正的实现在 Models.swift 的 URSupportDir：Cask 枚举在并发 Task 里也要用它
-    static let supportDir: URL = URSupportDir
+    // 真正的实现在 Models.swift 的 SentrySupportDir：Cask 枚举在并发 Task 里也要用它
+    static let supportDir: URL = SentrySupportDir
 
     private var storeURL: URL { Self.supportDir.appendingPathComponent("state.json") }
 
@@ -440,7 +440,7 @@ final class UpdateService: ObservableObject {
     /// 合盖一夜之后 Timer 攒下的到期事件会一次性全炸出来，它不会。
     private func scheduleAutoCheck() {
         scheduler?.invalidate()
-        let s = NSBackgroundActivityScheduler(identifier: "com.hushixiong.updateradar.autocheck")
+        let s = NSBackgroundActivityScheduler(identifier: "com.hushixiong.sentry.autocheck")
         s.repeats = true
         s.interval = max(0.25, settings.intervalHours) * 3600
         // 10 分钟内浮动，让系统挑它觉得合适的时间，别整点扎堆
@@ -462,7 +462,7 @@ final class UpdateService: ObservableObject {
             guard pathGate.movedToOnline(path.status == .satisfied) else { return }
             Task { @MainActor in self?.checkAll() }
         }
-        pathMonitor.start(queue: DispatchQueue(label: "com.hushixiong.updateradar.network"))
+        pathMonitor.start(queue: DispatchQueue(label: "com.hushixiong.sentry.network"))
 
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
@@ -576,7 +576,7 @@ private final class AppDirWatcher {
             UInt32(kFSEventStreamCreateFlagWatchRoot)
         )
         guard let stream else { return }
-        FSEventStreamSetDispatchQueue(stream, DispatchQueue(label: "com.hushixiong.updateradar.appwatch"))
+        FSEventStreamSetDispatchQueue(stream, DispatchQueue(label: "com.hushixiong.sentry.appwatch"))
         if !FSEventStreamStart(stream) {
             // 起不来就当作没监听：扫描按钮照常可用，不影响主要功能
             FSEventStreamInvalidate(stream)

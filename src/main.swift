@@ -125,7 +125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // 同样交给 NSBackgroundActivityScheduler：24 小时是大周期，
         // 更需要系统根据睡眠/电量来挑时间，而不是开机时挂一个死循环 Timer。
-        let selfCheck = NSBackgroundActivityScheduler(identifier: "com.hushixiong.updateradar.selfcheck")
+        let selfCheck = NSBackgroundActivityScheduler(identifier: "com.hushixiong.sentry.selfcheck")
         selfCheck.repeats = true
         selfCheck.interval = 24 * 3600
         selfCheck.tolerance = 2 * 3600
@@ -226,7 +226,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let close = NSMenuItem(title: "关闭窗口", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         appMenu.addItem(close)
         appMenu.addItem(.separator())
-        let quit = NSMenuItem(title: "退出更新雷达", action: #selector(quitApp), keyEquivalent: "q")
+        let quit = NSMenuItem(title: "退出 Sentry", action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self
         appMenu.addItem(quit)
         appItem.submenu = appMenu
@@ -405,7 +405,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !rippling { button.image = makeStatusIcon() }
         button.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
         button.title = (n > 0 && service.settings.countVisible) ? " \(n)" : ""
-        button.toolTip = n > 0 ? "\(n) 个 App 有新版本" : "更新雷达 · 全部都是最新的"
+        button.toolTip = n > 0 ? "\(n) 个 App 有新版本" : "Sentry · 全部都是最新的"
     }
 
     // MARK: - 扫描时"雷达波"
@@ -529,13 +529,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 菜单栏图标：18pt 的自绘模板图（圆圈 + 圆润箭头），跟最初那版一模一样。
     /// 走模板图，黑色由系统按菜单栏明暗自动换成白 —— 不做彩色、不缩放。
     private func makeStatusIcon() -> NSImage {
-        // 优先用 asset catalog 里的模板图（Resources/Assets.xcassets/UpdateRadarMenuBar.svg）：
+        // 优先用 asset catalog 里的模板图（Resources/Assets.xcassets/SentryMenuBar.svg）：
         // 矢量、任意缩放都清晰，设计师能直接改。template 渲染，系统按菜单栏明暗自动反色。
         //
         // 尺寸：SVG 的外框是 22，环只占 19.6/22。按 23pt 画出来环外沿约 20.5pt，
         // 比 20.5pt 时（外沿 18.3pt）明显大一圈，仍不超过菜单栏高度。
         let assetSide: CGFloat = 23
-        if let asset = NSImage(named: "UpdateRadarMenuBar")?.copy() as? NSImage {
+        if let asset = NSImage(named: "SentryMenuBar")?.copy() as? NSImage {
             asset.size = NSSize(width: assetSide, height: assetSide)
             asset.isTemplate = true
             return asset

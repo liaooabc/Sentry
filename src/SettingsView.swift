@@ -140,7 +140,7 @@ struct PanelSettingsView: View {
                 }
             }
 
-            // 「更新雷达」分组（当前版本 + 检查更新 / 安装）已搬到关于页，这里不再重复
+            // 「Sentry」分组（当前版本 + 检查更新 / 安装）已搬到关于页，这里不再重复
         }
         .padding(.horizontal, 14)
         .padding(.top, 4)

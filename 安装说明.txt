@@ -1,16 +1,16 @@
-更新雷达
+Sentry
 Apple 芯片版（arm64）· 需要 macOS 15.0 或更高
 
 安装
 ----
-把「更新雷达.app」拖到右边的 Applications 文件夹即可。
+把「Sentry.app」拖到右边的 Applications 文件夹即可。
 
 第一次打开会被系统拦住
 ----------------------
 因为这个 App 没有苹果开发者证书（只有临时签名），第一次双击会弹：
 
-    「未打开"更新雷达"
-     Apple 无法验证"更新雷达"是否包含可能危害 Mac 安全
+    「未打开"Sentry"
+     Apple 无法验证"Sentry"是否包含可能危害 Mac 安全
      或泄漏隐私的恶意软件。」
 
 任选一种方式放行（只需做一次，之后就正常了）：
@@ -20,10 +20,10 @@ A. 右键打开
 
 B. 系统设置
    弹窗里点「完成」→ 打开 系统设置 → 隐私与安全性 →
-   往下找到「已阻止使用"更新雷达"」→ 点「仍要打开」。
+   往下找到「已阻止使用"Sentry"」→ 点「仍要打开」。
 
 C. 终端
-   xattr -dr com.apple.quarantine /Applications/更新雷达.app
+   xattr -dr com.apple.quarantine /Applications/Sentry.app
 
 如果弹的是「已损坏，无法打开」，请用 C。
 
@@ -38,7 +38,7 @@ Dock 里不占位置，也没有多余窗口。
 卸载
 ----
 把 App 拖进废纸篓，再删除下面这个文件夹（存的是检测结果和设置）：
-  ~/Library/Application Support/UpdateRadar
+  ~/Library/Application Support/Sentry
 
 隐私
 ----

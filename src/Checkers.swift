@@ -481,7 +481,7 @@ enum Cask {
         var bundles: [String]?     // cask 里登记的 bundle id，用来复核同名不同版
     }
 
-    private static var cacheURL: URL { URSupportDir.appendingPathComponent("cask-cache.json") }
+    private static var cacheURL: URL { SentrySupportDir.appendingPathComponent("cask-cache.json") }
 
     /// 名称表随包发布：{"apps": {"sketch.app": "sketch"}, "bundles": {"com.microsoft.Word": "microsoft-word"}}
     private static func loadMap() {
