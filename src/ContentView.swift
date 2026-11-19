@@ -130,13 +130,343 @@ final class HoverBox: ObservableObject {
     @Published var on = false
 }
 
+/// 每行一个悬停开关：只重绘被悬停的那一行（文字转白、展开说明换色）。
+/// 「高亮条停在哪一行」不放在这里：那是下面 AppKit 覆盖层的事（见 HoverBarView）。
 final class HoverStore {
     private var boxes: [String: HoverBox] = [:]
+
     func box(for id: String) -> HoverBox {
         if let b = boxes[id] { return b }
         let b = HoverBox()
         boxes[id] = b
         return b
+    }
+}
+
+// MARK: - 悬停高亮条
+
+/// 行的锚点：一个空 NSView，只回答一个问题——这一行此刻在窗口里的哪儿。
+/// 之前高亮条的位置是 SwiftUI 的 frame(in: .named("urList")) 报上来的，
+/// List 背后的 NSTableView 滚动时，那份坐标既会滞后、也带一段内边距偏差，
+/// 实测整条比行高出 8pt 多。窗口坐标没有这两个毛病：行被 AppKit 挪到哪，锚点就跟到哪。
+final class RowAnchorView: NSView {
+    var anchorKey: String = ""
+    /// 这一行的悬停开关：高亮条找到这一行时顺便把文字转白
+    var box: HoverBox?
+
+    /// 别挡住行里的点击
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            RowAnchorStore.shared.remove(self)
+        } else {
+            RowAnchorStore.shared.add(self)
+        }
+    }
+}
+
+/// 还挂在屏幕上的行锚点（弱引用：行被 List 回收后自然消失）
+final class RowAnchorStore {
+    static let shared = RowAnchorStore()
+    private let views = NSHashTable<RowAnchorView>.weakObjects()
+
+    func add(_ view: RowAnchorView) { views.add(view) }
+    func remove(_ view: RowAnchorView) { views.remove(view) }
+
+    /// 鼠标（窗口坐标）压在哪一行上。key 的前缀是页号，把隐藏着的那一页的行挡掉。
+    /// 用 objectEnumerator 而不是 allObjects：滚动时这函数每帧都跑，少分配一次数组
+    func hit(at point: CGPoint, page: Int) -> RowAnchorView? {
+        let prefix = "\(page)#"
+        let e = views.objectEnumerator()
+        while let view = e.nextObject() as? RowAnchorView {
+            guard view.window != nil, view.anchorKey.hasPrefix(prefix) else { continue }
+            if view.convert(view.bounds, to: nil).contains(point) { return view }
+        }
+        return nil
+    }
+}
+
+/// 把锚点挂进行里
+private struct RowAnchor: NSViewRepresentable {
+    let anchorKey: String
+    let box: HoverBox
+
+    func makeNSView(context: Context) -> RowAnchorView {
+        let view = RowAnchorView()
+        view.anchorKey = anchorKey
+        view.box = box
+        return view
+    }
+
+    func updateNSView(_ view: RowAnchorView, context: Context) {
+        view.anchorKey = anchorKey
+        view.box = box
+    }
+}
+
+/// 高亮条本体：一块系统选中色，压在 List 底下（行的背景是透明的）。
+/// 它自己盯着鼠标：每 1/60 秒在行锚点里找「哪个矩形包住了指针」。
+/// 不用 SwiftUI 的 .onHover，是因为滚动时行从指针底下走过去不会再发悬停事件。
+///
+/// 滚动时行视图的坐标是滞后的，按它去追行只会得到「一帧一个行」的乱跳；
+/// 所以滚动期间（含惯性）蓝块原地不动，滚动停下后再滑到指针下那一行。
+final class HoverBarView: NSView {
+    /// 真正那块蓝底。外层视图的 frame 归 SwiftUI 管（铺满整页），
+    /// 这一块的 frame 由我们每帧自己摆——否则 SwiftUI 每次布局都会把它拉回整页
+    private let block = NSVisualEffectView()
+    private let page: Int
+    private var timer: Timer?
+    private var scrollMonitor: Any?
+    /// 正在显示（淡入淡出分别由 alphaValue 负责）
+    private var shown = false
+    /// 竖直方向的弹簧：位置 + 速度
+    private var springY: CGFloat = 0
+    private var velocityY: CGFloat = 0
+    private var springTargetY: CGFloat = 0
+    private var lastFrameTime: TimeInterval = 0
+    /// 上一次收到滚轮（含惯性）的时刻：用它判断「现在是不是在滚」
+    private var lastScrollTime: TimeInterval = 0
+    /// 上一帧行锚点给的 y：指针没动、它却在变，就说明是内容在滚
+    private var lastTargetY: CGFloat = .nan
+    /// 抓不到行的起始时刻：行间隙、组标题、滚动中行视图正在换，都先按原样停一会儿
+    private var missingSince: TimeInterval = 0
+    /// 上一帧指针在窗口里的位置：用来区分「指针移动」和「内容在滚」
+    private var lastPoint: CGPoint?
+    /// 上一帧是不是在滚动：用来抓「滚动刚停」的那一瞬间
+    private var wasScrolling = false
+    /// 在这个时刻之前，对齐一律走快速贴合（滚动刚停的收尾）
+    private var quickUntil: TimeInterval = 0
+    private weak var hovered: RowAnchorView?
+
+    init(page: Int) {
+        self.page = page
+        super.init(frame: .zero)
+        block.material = .selection
+        block.blendingMode = .withinWindow
+        block.state = .active
+        block.isEmphasized = true
+        block.wantsLayer = true
+        block.layer?.cornerRadius = 12
+        block.layer?.cornerCurve = .continuous
+        block.layer?.masksToBounds = true
+        block.autoresizingMask = []
+        block.alphaValue = 0
+        block.isHidden = true
+        addSubview(block)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// 别挡住行里的点击
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window == nil {
+            stop()
+        } else {
+            startTimer()
+        }
+    }
+
+    /// 页被拆掉 / 被隐藏时收尾
+    func stop() {
+        stopTimer()
+        shown = false
+        missingSince = 0
+        block.alphaValue = 0
+        block.isHidden = true
+        if let box = hovered?.box { box.on = false }
+        hovered = nil
+    }
+
+    // MARK: 跟随
+
+    private func startTimer() {
+        guard timer == nil else { return }
+        let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in self?.tick() }
+        // .common：滚轮滚动、菜单跟踪时也要照常跑
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+
+        // 滚轮（含惯性）只用来判断「现在在滚」，方向、速度都不需要：
+        // 滚动期间蓝块就停在原地，等滚完了再归位
+        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+            self?.noteScroll(event)
+            return event
+        }
+    }
+
+    private func stopTimer() {
+        timer?.invalidate()
+        timer = nil
+        if let scrollMonitor {
+            NSEvent.removeMonitor(scrollMonitor)
+            self.scrollMonitor = nil
+        }
+    }
+
+    private func noteScroll(_ event: NSEvent) {
+        guard let window else { return }
+        // 惯性滚动的 event.window 可能不是我们这扇窗，所以只按指针位置判断
+        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        guard bounds.contains(point) else { return }
+        lastScrollTime = ProcessInfo.processInfo.systemUptime
+    }
+
+    private func tick() {
+        guard let window, window.isVisible, bounds.width > 1 else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        // dt 卡上限：偶尔卡一帧也不会让弹簧冲出去
+        let dt = min(max(now - lastFrameTime, 1.0 / 240.0), 0.05)
+        lastFrameTime = now
+
+        // 滚动中：蓝块原地冻住，这一帧不去找行、不动画、也不碰 SwiftUI。
+        // 滚动是主线程最忙的时候（列表还在换行），每帧省一次全锚点遍历和行高亮切换
+        if shown, now - lastScrollTime < 0.15 {
+            velocityY = 0
+            springTargetY = springY
+            return
+        }
+
+        let inWindow = window.mouseLocationOutsideOfEventStream
+        let point = convert(inWindow, from: nil)
+        // 阈值放得很小：鼠标慢慢挪也算「动了」，不然慢速划过时会变成瞬移，一快一慢
+        let pointerMoved = lastPoint.map { hypot(point.x - $0.x, point.y - $0.y) > 0.1 } ?? true
+        lastPoint = point
+
+        // 指针离开整页：这才是真的离开
+        guard bounds.contains(point) else {
+            dismiss()
+            return
+        }
+
+        guard let hit = RowAnchorStore.shared.hit(at: inWindow, page: page) else {
+            // 还在页里却没压到行：行间隙、组标题，或者滚动中行视图正在换。
+            // 先原地停住别淡出，超过 0.35s 还是抓不到才收起来
+            if shown {
+                if missingSince == 0 { missingSince = now }
+                if now - missingSince < 0.35 { return }
+            }
+            dismiss()
+            return
+        }
+        missingSince = 0
+        setHovered(hit)
+
+        let rect = convert(hit.convert(hit.bounds, to: nil), from: nil)
+            .insetBy(dx: 0, dy: 1)
+            .intersection(bounds)
+        guard !rect.isNull, rect.width > 2, rect.height > 2 else { return }
+
+        if !shown {
+            shown = true
+            wasScrolling = false
+            springY = rect.minY
+            velocityY = 0
+            springTargetY = rect.minY
+            lastTargetY = rect.minY
+            block.isHidden = false
+            block.frame = CGRect(x: rect.minX, y: springY, width: rect.width, height: rect.height)
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.10
+                self.block.animator().alphaValue = 1
+            }
+            return
+        }
+
+        let scrolling = (!pointerMoved && lastTargetY.isFinite && abs(rect.minY - lastTargetY) > 0.05)
+            || now - lastScrollTime < 0.15
+        lastTargetY = rect.minY
+        if pointerMoved {
+            // 指针自己在动：弹簧滑过去，这是手感最好的那种
+            wasScrolling = false
+            let omega: CGFloat = 19
+            let zeta: CGFloat = 0.82
+            springTargetY = rect.minY
+            velocityY += (omega * omega * (springTargetY - springY) - 2 * zeta * omega * velocityY) * dt
+            springY += velocityY * dt
+            if abs(springTargetY - springY) < 0.2, abs(velocityY) < 4 {
+                springY = springTargetY
+                velocityY = 0
+            }
+        } else if scrolling {
+            // 正在滚（含惯性）：原地冻住。跟着行跑必然要在换行时跳一整行，滚得越快跳得越密
+            wasScrolling = true
+            velocityY = 0
+            springTargetY = springY
+        } else {
+            if wasScrolling {
+                wasScrolling = false
+                // 滚停之后行锚点可能还会修正一两像素，这期间也走快速贴合，别留尾巴
+                quickUntil = now + 0.4
+            }
+            springTargetY = rect.minY
+            if now < quickUntil {
+                approach(dt: dt)
+            } else {
+                let omega: CGFloat = 24
+                let zeta: CGFloat = 1.0
+                velocityY += (omega * omega * (springTargetY - springY) - 2 * zeta * omega * velocityY) * dt
+                springY += velocityY * dt
+                if abs(springTargetY - springY) < 0.2, abs(velocityY) < 4 {
+                    springY = springTargetY
+                    velocityY = 0
+                }
+            }
+        }
+        block.frame = CGRect(x: rect.minX, y: springY, width: rect.width, height: rect.height)
+    }
+
+    /// 停滚后立刻贴合：指数收敛，约 4 帧（~70ms）到位。
+    /// 肉眼看到的是「已经在那儿了」，而不是「又滑了半行」。
+    private func approach(dt: TimeInterval) {
+        let k = CGFloat(1 - exp(-dt / 0.012))
+        springY += (springTargetY - springY) * k
+        velocityY = 0
+        if abs(springTargetY - springY) < 0.4 { springY = springTargetY }
+    }
+
+    private func setHovered(_ view: RowAnchorView) {
+        guard hovered !== view else { return }
+        let old = hovered?.box
+        hovered = view
+        view.box?.on = true
+        if let old, old !== view.box { old.on = false }
+    }
+
+    private func dismiss() {
+        if let box = hovered?.box { box.on = false }
+        hovered = nil
+        velocityY = 0
+        lastTargetY = .nan
+        missingSince = 0
+        wasScrolling = false
+        guard shown else { return }
+        shown = false
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.12
+            self.block.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            guard let self, !self.shown else { return }
+            self.block.isHidden = true
+        })
+    }
+}
+
+private struct HoverBarOverlay: NSViewRepresentable {
+    let page: Int
+
+    func makeNSView(context: Context) -> HoverBarView {
+        HoverBarView(page: page)
+    }
+
+    func updateNSView(_ view: HoverBarView, context: Context) {}
+
+    static func dismantleNSView(_ view: HoverBarView, coordinator: ()) {
+        view.stop()
     }
 }
 
@@ -313,7 +643,7 @@ struct ContentView: View {
             VStack(spacing: 6) {
                 Image(nsImage: NSApp.applicationIconImage ?? NSImage())
                     .resizable()
-                    .frame(width: 72, height: 72)
+                    .frame(width: 84, height: 84)
 
                 Text("Sentry")
                     .font(.system(size: 16, weight: .semibold))
@@ -812,37 +1142,64 @@ private struct ListPage: View {
         return visible.first { ui.hovers.box(for: $0.id).on }
     }
 
-    /// 菜单内容跟原来 SwiftUI 里的 .contextMenu 一致
+    /// 行右键菜单：四项固定（打开 / 在访达中显示 / 忽略·提醒更新 / 卸载），
+    /// 前面带 SF Symbol 图标。「可更新」页用「忽略更新」，其余页用「提醒更新」
+    /// （点了就把忽略 / 已是最新的标记撤掉，之后有新版照常提醒）。
     private func rowMenu(_ row: AppRow, _ handler: MenuHandler) -> NSMenu {
         handler.reset()
         let menu = NSMenu()
-        func add(_ title: String, _ run: @escaping () -> Void) {
-            menu.addItem(handler.item(title, run))
+        func add(_ title: String, _ symbol: String, _ run: @escaping () -> Void) {
+            let item = handler.item(title, run)
+            item.attributedTitle = menuTitle(title, symbol)
+            menu.addItem(item)
         }
-        if row.result?.downloadURL != nil {
-            add("打开下载页") { service.openUpdate(for: row) }
-        }
-        add("打开这个 App") { service.launch(row.app) }
-        add("在 Finder 中显示") { service.reveal(row.app) }
-        menu.addItem(.separator())
-        if row.isUpdate {
-            add("这个已经是最新") { service.dismiss(row) }
-        }
-        if service.isDismissed(row.id) {
-            add("恢复提醒") { service.undismiss(row.id) }
-        }
-        if service.settings.ignored.contains(row.id) {
-            add("恢复提醒") { service.unignore(row.id) }
+        add("打开", "macwindow") { service.launch(row.app) }
+        add("在访达中显示", "folder") { service.reveal(row.app) }
+
+        if index == 0 {
+            add("忽略更新", "eye.slash") { service.ignore(row.app) }
         } else {
-            add("忽略它") { service.ignore(row.app) }
+            add("提醒更新", "bell") {
+                service.unignore(row.id)
+                service.undismiss(row.id)
+            }
+        }
+
+        if Uninstaller.canUninstall(row.app) {
+            add("卸载", "trash") {
+                // 菜单收起后再弹确认框，避免在菜单跟踪循环里再开一个模态窗口
+                DispatchQueue.main.async {
+                    Uninstaller.present(for: row.app) { service.rescan() }
+                }
+            }
         }
         return menu
+    }
+
+    /// 系统菜单不画 NSMenuItem.image，只能把符号图塞进富文本附件里
+    private func menuTitle(_ text: String, _ symbol: String) -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
+            let attachment = NSTextAttachment()
+            attachment.image = image
+            attachment.bounds = NSRect(x: 0, y: -2, width: 15, height: 13)
+            out.append(NSAttributedString(attachment: attachment))
+            out.append(NSAttributedString(string: "  " + text))
+        } else {
+            out.append(NSAttributedString(string: text))
+        }
+        return out
     }
 
     var body: some View {
         GeometryReader { geo in
             let viewHeight = geo.size.height
             ScrollViewReader { proxy in
+                // 共用高亮条压在 List 底下（行的背景是透明的），
+                // 所以划过一行时看到的是同一块蓝底滑过去，而不是上一行灭、下一行亮
+                ZStack(alignment: .topLeading) {
+                HoverBarOverlay(page: index)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 List {
                 Color.clear.frame(height: 0).id("top")
                     .listChrome()
@@ -908,6 +1265,7 @@ private struct ListPage: View {
             // 系统的滚动边缘效果：滑到顶/底时，被条遮住的那一段由系统做渐隐，
             // 不是我们自己画的渐变，所以深浅色、壁纸、透明度都跟系统一致。
             .modifier(ScrollEdgeBlur())
+                }
             }
             .coordinateSpace(name: "urList")
         }
@@ -926,9 +1284,11 @@ private struct ListPage: View {
                              ignored: Bool = false,
                              tabIndex: Int) -> some View {
         ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
+            let anchorKey = "\(tabIndex)#\(row.id)"
             RowView(row: row,
                     service: service,
                     hover: ui.hovers.box(for: row.id),
+                    anchorKey: anchorKey,
                     ignored: ignored,
                     expanded: ui.expanded.contains(row.id),
                     // 分隔线自己画：系统的会铺满整行，从图标左边就起，跟名字对不齐
@@ -939,7 +1299,7 @@ private struct ListPage: View {
                         ui.keyRow = row.id
                         withAnimation(.easeInOut(duration: 0.16)) { ui.toggleExpanded(row.id) }
                     },
-                    // 展开的行自己上报位置；收起的行不上报（滚动时零开销）
+                    // 行自己上报位置：列表用它判断展开说明要不要滚一下
                     onFrame: { ui.rowFramesByTab[tabIndex, default: [:]][row.id] = $0 })
             .listRowInsets(EdgeInsets())
             .listRowBackground(Color.clear)
@@ -1370,21 +1730,6 @@ private struct PressablePlainButton: ButtonStyle {
     }
 }
 
-/// 让 AppKit 自己画悬停底色：`.selection` 材质就是系统菜单、侧边栏里选中那一块的蓝，
-/// 浓度、透明度、强调色跟随都由系统决定。我们只把它裁成 12 的圆角。
-private struct SystemSelectionBackground: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let view = NSVisualEffectView()
-        view.material = .selection
-        view.blendingMode = .withinWindow
-        view.state = .active
-        view.isEmphasized = true
-        return view
-    }
-
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
-}
-
 /// 图标交给 AppKit 自己画：缓存里那张图带浅色/深色两份表示，
 /// 系统换外观时这个 NSView 会收到回调重绘，AppKit 按当前外观挑对应那份。
 /// 之前用 SwiftUI 的 Image + colorScheme 取图，面板这套自建窗口里 body
@@ -1430,6 +1775,8 @@ struct RowView: View {
     let row: AppRow
     let service: UpdateService
     @ObservedObject var hover: HoverBox
+    /// 这一行的锚点名字：整页的高亮条靠它找到这一行的窗口坐标
+    var anchorKey: String = ""
     var ignored: Bool = false
     /// 更新说明展开着没
     var expanded: Bool = false
@@ -1503,8 +1850,9 @@ struct RowView: View {
         // 「更新」按钮离右边 23pt，看着就是歪的。外层的 8pt 已经够让滚动条错开了。
         .padding(.horizontal, 4)
         .padding(.vertical, 8)
-        // 只有展开的行量自己位置：这一件事只在点开说明时用得上，
-        // 收起的行完全不参与几何上报，滚动时不会再有几十上百行的几何计算。
+        // 每行都把位置报给列表：展开说明时判断要不要滚一下。
+        // 只有展开着的行才需要这个位置，收起的行一个都不挂（滚动时每行每帧量一次坐标，
+        // 就是列表不跟手的主因之一）
         .background {
             if expanded {
                 GeometryReader { g in
@@ -1515,22 +1863,21 @@ struct RowView: View {
                 }
             }
         }
-        // 悬停态交给系统（NSVisualEffectView .selection），展开态仍用强调色的淡底。
+        // 给高亮条定位的是这个 AppKit 锚点：它报的是窗口坐标，不经过 SwiftUI 的
+        // 布局/滚动，行滚到哪它就在哪，不会被 List 的内边距带偏
+        .background { RowAnchor(anchorKey: anchorKey, box: hover) }
+        // 悬停的蓝底不画在行里，改成整页共用一块会滑动的（见 HoverBarView）：
+        // 行里只留展开说明的淡底。
         .background {
-            if hover.on {
-                // 交给系统画：.selection 材质就是菜单/侧边栏里那块蓝，
-                // 颜色浓度和暗色适配都不归我们管，省得自己调出来的蓝比系统重
-                SystemSelectionBackground()
-                    .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    .padding(.vertical, 1)
-            } else if expanded {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(Color(nsColor: .selectedContentBackgroundColor).opacity(0.12))
-                    .padding(.vertical, 1)
-            }
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color(nsColor: .selectedContentBackgroundColor).opacity(0.12))
+                .opacity(expanded && !hover.on ? 1 : 0)
+                .padding(.vertical, 1)
         }
         .contentShape(Rectangle())
-        .onHover { hover.on = $0 }
+        // 文字转白跟着高亮条同一条弹簧走，整行是一起「漫」过去的
+        .animation(.spring(response: 0.30, dampingFraction: 0.84), value: hover.on)
+
         // 分隔线：跟 App Store 的「最近更新」一致，从图标左边缘起、到内容右边缘止，
         // 也就是和整行的内容区同宽，不是对齐到文字。
         .overlay(alignment: .bottom) {
