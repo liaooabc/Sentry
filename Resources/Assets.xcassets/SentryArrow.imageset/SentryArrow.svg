@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 22 22">
+  <!--
+    Sentry · 向下箭头（扫描动画的静止层）。
+
+    从完整图标 SentryMenuBar.svg 里去掉开口环和三个点，只留箭头。
+    扫描时箭头不动、只有环+点那层转 —— 下载方向不能跟着转。
+    几何与完整版一致：箭杆 x=11, y=7.48→13.08，描边 2.32；
+    箭尖朝下 y=14.84（原稿写反过，Xcode 按 y 向下画，这里是对的）。
+  -->
+  <g fill="none" stroke="#000" stroke-linecap="round" stroke-linejoin="round">
+    <!-- 箭杆 -->
+    <line x1="11" y1="7.48" x2="11" y2="13.08" stroke-width="2.32"/>
+    <!-- 箭头（朝下） -->
+    <polyline points="7.56,11.64 11,14.84 14.44,11.64" stroke-width="2.32"/>
+  </g>
+</svg>

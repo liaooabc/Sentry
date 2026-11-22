@@ -20,6 +20,11 @@ final class PanelWindow: NSPanel {
     }
 }
 
+/// 菜单栏图标的三种取法：完整静态图，或扫描动画拆出的箭头层 / 环+点层。
+enum StatusIconPart {
+    case full, arrow, ringDots
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
@@ -42,15 +47,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 所以「点图标」不能被当成「点别处」：应用失活、全局点击两条收起路径都要放行。
     private var statusItemRect: NSRect = .zero
 
-    // 扫描时图标本身不动：底图换成「无点版」，三个点沿开口环转圈（加载效果）。
+    // 扫描时：箭头那层不动，「开口环 + 三个点」整层绕中心转（加载效果）。
+    // 缺口和点一起转，点始终待在缺口里，不会转到环上融进去。
     private var scanAnimating = false
-    private var iconLayer: CALayer?
-    private var spinnerLayer: CALayer?
-    private var dotLayers: [CAShapeLayer] = []
-    /// 轨道/点半径按 SVG 的 22 画布等比取，改图标尺寸时自动跟随，不用手调
-    private static let dotOrbitRatio: CGFloat = 9.6 / 22   // 环外沿再外一点（7.6 + 描边1 + 点1）
-    private static let dotRadiusRatio: CGFloat = 1.0 / 22  // 点直径 2；放环外才看得见在转
-    private static let dotAngles: [CGFloat] = [-26, 0, 26] // 静止时三点位置（相对正上，度）
+    private var arrowLayer: CALayer?
+    private var ringLayer: CALayer?
     private static let spinPeriod: CFTimeInterval = 1.1    // 转一圈
 
     private let panelSize = NSSize(width: PanelMetrics.width, height: PanelMetrics.height)
@@ -641,14 +642,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return img
     }
 
-    /// 单个点的圆路径，中心在 (x, y)、半径 r。
-    private func dotPath(x: CGFloat, y: CGFloat, r: CGFloat) -> CGPath {
-        CGPath(ellipseIn: CGRect(x: x - r, y: y - r, width: r * 2, height: r * 2), transform: nil)
-    }
-
-    /// 扫描时的加载动画：底图换成「无点版」（只剩开口环 + 箭头），
-    /// 三个点沿环中线转圈。菜单栏只有 17pt，点与环同粗（直径 2），
-    /// 不叠任何淡环/波纹，避免糊成一团。
+    /// 扫描时的加载动画：拆成两层——箭头不动，「开口环 + 三个点」整层绕中心转。
+    /// 因为缺口和点是一体的，点始终待在缺口里，转到哪都看得见；箭头保持朝下。
     private func startScanAnimation() {
         guard !scanAnimating, let button = statusItem.button else { return }
         scanAnimating = true
@@ -665,39 +660,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             rect = cell.imageRect(forBounds: button.bounds)
         }
 
-        // 底图：无点版。跟静态图同一套几何，只是少了那三个点（由动画层来画）。
-        let icon = CALayer()
-        icon.frame = rect
-        icon.contentsGravity = .resizeAspect
-        icon.contentsScale = scale
-        icon.contents = tintedCGImage(makeStatusIcon(baseOnly: true), color: color, scale: scale)
-        button.layer?.addSublayer(icon)
-        iconLayer = icon
-
-        // 三个点放进一个容器层，容器绕中心转 = 点沿环跑。
-        // geometryFlipped 让容器内部 y 向下，跟 SVG 坐标一致（0° 在正上方）。
-        let spinner = CALayer()
-        spinner.frame = rect
-        spinner.contentsScale = scale
-        spinner.isGeometryFlipped = true
-        button.layer?.addSublayer(spinner)
-        spinnerLayer = spinner
-
-        let side = min(rect.width, rect.height)
-        let orbit = side * Self.dotOrbitRatio
-        let dotR = side * Self.dotRadiusRatio
-        let center = CGPoint(x: rect.width / 2, y: rect.height / 2)
-        for deg in Self.dotAngles {
-            let rad = deg * .pi / 180
-            let x = center.x + orbit * CGFloat(sin(rad))
-            let y = center.y - orbit * CGFloat(cos(rad))
-            let dot = CAShapeLayer()
-            dot.path = dotPath(x: x, y: y, r: dotR)
-            dot.fillColor = color.cgColor
-            dot.contentsScale = scale
-            spinner.addSublayer(dot)
-            dotLayers.append(dot)
+        func imageLayer(_ part: StatusIconPart) -> CALayer {
+            let l = CALayer()
+            l.frame = rect
+            l.contentsGravity = .resizeAspect
+            l.contentsScale = scale
+            l.contents = tintedCGImage(makeStatusIcon(part), color: color, scale: scale)
+            button.layer?.addSublayer(l)
+            return l
         }
+
+        // 箭头：静止层，压在环下面
+        arrowLayer = imageLayer(.arrow)
+        // 环 + 三点：整层旋转（初始角度与静态图一致，切换不跳变）
+        let ring = imageLayer(.ringDots)
+        ringLayer = ring
 
         let spin = CABasicAnimation(keyPath: "transform.rotation.z")
         spin.fromValue = 0
@@ -706,33 +683,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         spin.repeatCount = .infinity
         spin.isRemovedOnCompletion = false
         spin.timingFunction = CAMediaTimingFunction(name: .linear)
-        spinner.add(spin, forKey: "spin")
+        ring.add(spin, forKey: "spin")
     }
 
     private func stopScanAnimation() {
         guard scanAnimating else { return }
         scanAnimating = false
-        let layers: [CALayer] = dotLayers + [spinnerLayer, iconLayer].compactMap { $0 }
-        for layer in layers {
+        for layer in [ringLayer, arrowLayer].compactMap({ $0 }) {
             layer.removeAllAnimations()
             layer.removeFromSuperlayer()
         }
-        dotLayers = []
-        spinnerLayer = nil
-        iconLayer = nil
+        ringLayer = nil
+        arrowLayer = nil
         statusItem.button?.image = makeStatusIcon()
     }
 
     /// 菜单栏图标：模板图（开口环 + 三个点 + 箭头）。走 template 渲染，
-    /// 系统按菜单栏明暗自动反色。`baseOnly` 取无点底图，给扫描动画用。
-    private func makeStatusIcon(baseOnly: Bool = false) -> NSImage {
+    /// 系统按菜单栏明暗自动反色。扫描动画把箭头和「环+点」拆成两层分别取。
+    private func makeStatusIcon(_ part: StatusIconPart = .full) -> NSImage {
         // 优先用 asset catalog 里的矢量模板图，任意缩放都清晰，设计师能直接改。
-        // SentryMenuBar = 完整版；SentryMenuBarBase = 无点版（扫描时三个点由图层画）。
+        // 三张 SVG 几何完全一致，叠起来就是完整图标：
+        // SentryMenuBar（完整）/ SentryArrow（箭头）/ SentryRingDots（环+三点）。
         //
         // 尺寸：SVG 的外框是 22，环只占 19.6/22。按 22pt 画出来环外沿约 19.6pt，
         // 比 23pt 时（外沿 20.5pt）小一点点，仍不超过菜单栏高度。
         let assetSide: CGFloat = 22
-        let name = baseOnly ? "SentryMenuBarBase" : "SentryMenuBar"
+        let name: String
+        switch part {
+        case .full:     name = "SentryMenuBar"
+        case .arrow:    name = "SentryArrow"
+        case .ringDots: name = "SentryRingDots"
+        }
         if let asset = NSImage(named: name)?.copy() as? NSImage {
             asset.size = NSSize(width: assetSide, height: assetSide)
             asset.isTemplate = true
