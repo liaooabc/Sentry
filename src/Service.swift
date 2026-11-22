@@ -32,6 +32,10 @@ final class UpdateService: ObservableObject {
     private var pendingRescan: DispatchWorkItem?
     /// 结果重绘节流
     private var pendingRebuild: DispatchWorkItem?
+    /// 切换「接收测试版」欠下的重查 bundle id。撞上正在跑的那一轮时先攒着，
+    /// 等它收尾补上 —— 否则 checkAll 开头的 guard !checking 会静默吞掉这次重查，
+    /// 界面就停在「开关已关、却还报着 beta」（那一轮用的是切换前捕获的 allowBeta）。
+    private var pendingBetaRecheck: Set<String>?
 
     // 真正的实现在 Models.swift 的 SentrySupportDir：Cask 枚举在并发 Task 里也要用它
     static let supportDir: URL = SentrySupportDir
@@ -241,6 +245,9 @@ final class UpdateService: ObservableObject {
             self.save()
             self.notifyIfNeeded()
             self.retryFailedIfNeeded()
+            // 检测期间用户切过「接收测试版」的话，那次重查被 guard !checking 挡掉了，
+            // 现在这轮结束、checking 已归零，补跑它。否则 beta 会一直挂在列表上。
+            self.flushPendingBetaRecheck()
             if ProcessInfo.processInfo.environment["UR_DEBUG"] != nil {
                 let ms = Int(Date().timeIntervalSince(started) * 1000)
                 FileHandle.standardError.write("[UR] 本轮查了 \(targets.count) 个 App，用时 \(ms) ms\n".data(using: .utf8)!)
@@ -443,6 +450,9 @@ final class UpdateService: ObservableObject {
             } else {
                 // 关掉：现在正在提示测试版的那几条要立刻改判
                 if let l = r.latest, isPrereleaseVersion(l) { return row.id }
+                // 正在跑的那一轮可能刚把某个源里的 beta 写进来（此时 row.result 还是旧的、
+                // 看不出 beta）。appcast / electron 有 beta 通道，一起重查才不会漏。
+                if r.source == "sparkle" || r.source == "electron" { return row.id }
             }
             // 被这个开关压下去的（商店 / 厂商规则 / cask / 只有 beta 的 appcast），
             // 两个方向都要重查
@@ -454,7 +464,17 @@ final class UpdateService: ObservableObject {
             FileHandle.standardError.write(line.data(using: .utf8)!)
         }
         guard !affected.isEmpty else { return }
-        checkAll(force: true, only: affected)
+        // 撞上正在跑的一轮就先记账，等它收尾补查。直接调 checkAll 会被
+        // 开头的 guard !checking 静默吞掉，开关就「关了个寂寞」。
+        pendingBetaRecheck = (pendingBetaRecheck ?? []).union(affected)
+        flushPendingBetaRecheck()
+    }
+
+    /// 补跑切换「接收测试版」欠下的重查。正在检测时攒着，收尾再叫。
+    private func flushPendingBetaRecheck() {
+        guard !checking, let ids = pendingBetaRecheck, !ids.isEmpty else { return }
+        pendingBetaRecheck = nil
+        checkAll(force: true, only: ids)
     }
 
     // MARK: - 通知

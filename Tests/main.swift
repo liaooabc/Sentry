@@ -398,6 +398,40 @@ expectEqual(diaItems.first?.buildVersion, "91297", "sparkle:version 仍是构建
 expect(diaItems.first?.enclosure?.hasSuffix(".zip") == true,
        "下载地址取完整包（.zip），不被后面的 .delta 增量包覆盖")
 
+// MARK: - beta 通道 / 版本号必须能被认出来（2026-11-23「关了开关还报测试版」）
+// MacMix 的 appcast 首条是 beta：既有 <sparkle:channel>beta</sparkle:channel>，
+// shortVersionString 也写着 "2.3.8 Beta 1"。两个信号都得能识别，
+// 否则 allowBeta=false 时 sparkle() 会把它当正式版推出去。
+let betaXML = """
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <item>
+      <title>MacMix 2.3.8 Beta 1</title>
+      <sparkle:version>35</sparkle:version>
+      <sparkle:shortVersionString>2.3.8 Beta 1</sparkle:shortVersionString>
+      <sparkle:channel>beta</sparkle:channel>
+      <sparkle:minimumSystemVersion>14.4</sparkle:minimumSystemVersion>
+      <enclosure url="https://github.com/ljmng7/MacMix/releases/download/v2.3.8-beta.1/MacMix-beta.dmg"
+        sparkle:version="35" length="1" type="application/octet-stream"/>
+    </item>
+    <item>
+      <title>MacMix 2.3.7</title>
+      <sparkle:version>34</sparkle:version>
+      <sparkle:shortVersionString>2.3.7</sparkle:shortVersionString>
+      <enclosure url="https://github.com/ljmng7/MacMix/releases/download/v2.3.7/MacMix.dmg"
+        sparkle:version="34" length="1" type="application/octet-stream"/>
+    </item>
+  </channel>
+</rss>
+"""
+let betaItems = AppcastParser().parse(Data(betaXML.utf8))
+expectEqual(betaItems.count, 2, "MacMix appcast 解析出两条")
+expectEqual(betaItems.first?.channel, "beta", "beta 通道标记被读到")
+expectEqual(betaItems.first?.marketingVersion, "2.3.8 Beta 1", "beta 版本号完整保留（没被当成构建号拆掉）")
+expect(isPrereleaseVersion(betaItems.first?.marketingVersion ?? ""), "2.3.8 Beta 1 判为测试版")
+expect(!isPrereleaseVersion(betaItems[1].marketingVersion ?? ""), "2.3.7 正式版不误判")
+
 // MARK: -
 
 if failures > 0 {
