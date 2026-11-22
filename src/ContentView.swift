@@ -26,7 +26,8 @@ final class ChromeState: ObservableObject {
     @Published var hoverTab: Int?
     /// 两格各自在轨道里的位置，用来让选中胶囊滑过去
     @Published var tabFrames: [Int: CGRect] = [:]
-    /// 搜索框是不是正在编辑：决定要不要把「最近搜索」列出来
+    /// 顶栏是不是搜索态：决定右侧显示输入框（而不是「排序 / 搜索」两颗按钮），
+    /// 也决定要不要把「最近搜索」列出来。
     @Published var searchActive = false
     /// 面板当前显示的是设置页（点齿轮翻过去，点「返回」翻回来）
     @Published var showSettings = false
@@ -43,6 +44,10 @@ final class UIState: ObservableObject {
     let chrome = ChromeState()
     /// 底栏「扫描」按钮的鼠标悬停状态（自绘玻璃按钮，明暗要自己给）
     let scanHover = HoverBox()
+    /// 顶栏「排序 / 搜索」两颗按钮的悬停状态：玻璃垫在 Menu / Button 底下，
+    /// 指针事件被上面那层吃掉，interactive 的悬停高亮不会亮，只能自己叠一层
+    let sortHover = HoverBox()
+    let searchHover = HoverBox()
     /// 「当前哪个页签」。真正的发布源在 chrome 里，列表页不受影响
     var tab: Int {
         get { chrome.tab }
@@ -86,7 +91,7 @@ final class UIState: ObservableObject {
     /// 键盘（↑↓）选中的行；Return 打开它的下载页 / 在 Finder 中显示。
     /// 同时作为 List 的 selection 绑定，选中底色由系统画。
     @Published var keyRow: String?
-    /// 每一行在列表可视区里的位置（不发布，只给「要不要滚」用，避免滚动时反复重绘）
+    /// 每一行在列表可视区里的位置（不发布，只给键盘 ↑↓ 排序用）
     var rowFramesByTab: [Int: [String: CGRect]] = [:]
 
     /// 最近搜索过的关键词，最新的在前，最多 5 条
@@ -201,6 +206,12 @@ private struct RowAnchor: NSViewRepresentable {
     }
 
     func updateNSView(_ view: RowAnchorView, context: Context) {
+        // List 会复用行宿主：同一个锚点可能已经换成另一行了。
+        // 旧行那份「悬停中」必须当场熄掉，否则它会一直白着，
+        // 而蓝块早跟着指针滑到别处了 —— 看到的就是「文字白、没有蓝底」。
+        if view.anchorKey != anchorKey, view.box?.on == true {
+            view.box?.on = false
+        }
         view.anchorKey = anchorKey
         view.box = box
     }
@@ -212,6 +223,11 @@ private struct RowAnchor: NSViewRepresentable {
 ///
 /// 滚动时行视图的坐标是滞后的，按它去追行只会得到「一帧一个行」的乱跳；
 /// 所以滚动期间（含惯性）蓝块原地不动，滚动停下后再滑到指针下那一行。
+///
+/// 横向（左右滑出按钮）反过来：行在横移，蓝块必须跟着行内容走 ——
+/// 不跟的话滑出来的按钮会被压在蓝块底下、行内容跑到框外面。但「跟」也分两种：
+/// 手势进行中直接跟（拖拽不能有滞后），其它时候（行自己滑开/弹回）走一根硬弹簧，
+/// 把一帧 112pt 的跳变摊成 70ms 的位移，看起来是「滑过去」而不是「跳过去」。
 final class HoverBarView: NSView {
     /// 真正那块蓝底。外层视图的 frame 归 SwiftUI 管（铺满整页），
     /// 这一块的 frame 由我们每帧自己摆——否则 SwiftUI 每次布局都会把它拉回整页
@@ -228,8 +244,24 @@ final class HoverBarView: NSView {
     private var lastFrameTime: TimeInterval = 0
     /// 上一次收到滚轮（含惯性）的时刻：用它判断「现在是不是在滚」
     private var lastScrollTime: TimeInterval = 0
+    /// 横滑（左右滑出按钮）的截止时刻。横滑和竖滚都是 scrollWheel 事件，
+    /// 但两者要的东西正好相反：竖滚时蓝块必须冻住（行在换，跟着跑会跳），
+    /// 横滑时蓝块必须跟着行走（行在横移）。所以按手势方向分开处理。
+    private var horizontalUntil: TimeInterval = 0
     /// 上一帧行锚点给的 y：指针没动、它却在变，就说明是内容在滚
     private var lastTargetY: CGFloat = .nan
+    /// 上一帧行锚点给的高度。高度是会突变的（点开/收起更新说明时行自己长高），
+    /// 而 y 走的是弹簧 —— 两者不同步就会拼出一个「旧位置 + 新高度」的方块。
+    private var lastHeight: CGFloat = 0
+    /// 蓝块的横向位置 + 宽度。它俩也跟行内容走，但走的是「硬弹簧」而不是瞬移：
+    /// 行被左/右滑开时，锚点会从 14/336 一帧跳到 126/238（滑出按钮的那段被裁掉了），
+    /// 直接赋值看着就是「预选框啪地跳一下」；用一根很硬的弹簧滑过去，
+    /// 连续横滑时几乎看不出滞后，跳跃也被摊成 70ms 的位移。
+    /// 横滑进行中（有连续的横滑事件）则直接赋值 —— 那会儿是手指在拖，滞后就是错位。
+    private var springX: CGFloat = .nan
+    private var velocityX: CGFloat = 0
+    private var springW: CGFloat = .nan
+    private var velocityW: CGFloat = 0
     /// 抓不到行的起始时刻：行间隙、组标题、滚动中行视图正在换，都先按原样停一会儿
     private var missingSince: TimeInterval = 0
     /// 上一帧指针在窗口里的位置：用来区分「指针移动」和「内容在滚」
@@ -239,6 +271,9 @@ final class HoverBarView: NSView {
     /// 在这个时刻之前，对齐一律走快速贴合（滚动刚停的收尾）
     private var quickUntil: TimeInterval = 0
     private weak var hovered: RowAnchorView?
+    /// 最后点亮的那一份文字状态。不能只靠 hovered 记：行宿主会被 List 复用，
+    /// 同一个锚点换了行之后，旧的那份还亮着，得由这里负责熄掉。
+    private weak var litBox: HoverBox?
 
     init(page: Int) {
         self.page = page
@@ -278,8 +313,47 @@ final class HoverBarView: NSView {
         missingSince = 0
         block.alphaValue = 0
         block.isHidden = true
-        if let box = hovered?.box { box.on = false }
+        clearHover()
+    }
+
+    /// 把点亮的那一行熄掉。
+    /// hover.on 只负责文字颜色，蓝底是这块 AppKit 视图自己画的：
+    /// 只要有一条路径漏了复位，界面上就会剩下一行「白字、没有蓝底」。
+    private func clearHover() {
+        if litBox?.on == true { litBox?.on = false }
+        litBox = nil
         hovered = nil
+    }
+
+    /// 自己这一层到窗口之间有没有被隐藏 / 透明掉。
+    /// 两个页签的列表是常驻的（见 PageClipView），隐藏的那一页只是 alphaValue = 0：
+    /// 它的行锚点照样躺在窗口坐标上，Tick 会误判成「指针压在这一行」，
+    /// 于是把文字点亮，蓝块却画在透明的页里 —— 当前页看着就是「某一行莫名白字」。
+    /// 面板 orderOut 之后同理：窗口不可见，继续 Tick 只会留下脏状态。
+    private var effectivelyVisible: Bool {
+        var v: NSView? = self
+        while let cur = v {
+            if cur.isHidden || cur.alphaValue < 0.01 { return false }
+            v = cur.superview
+        }
+        return true
+    }
+
+    /// 不可见时收干净，但**不停 Timer**：页面重新显示时没有别的东西会把 Timer 叫起来。
+    private func suspend() {
+        clearHover()
+        guard shown || !block.isHidden else { return }
+        shown = false
+        missingSince = 0
+        block.alphaValue = 0
+        block.isHidden = true
+        velocityY = 0
+        velocityX = 0
+        velocityW = 0
+        lastPoint = nil
+        lastTargetY = .nan
+        lastHeight = 0
+        wasScrolling = false
     }
 
     // MARK: 跟随
@@ -313,20 +387,37 @@ final class HoverBarView: NSView {
         // 惯性滚动的 event.window 可能不是我们这扇窗，所以只按指针位置判断
         let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
         guard bounds.contains(point) else { return }
-        lastScrollTime = ProcessInfo.processInfo.systemUptime
+        let now = ProcessInfo.processInfo.systemUptime
+        lastScrollTime = now
+        // 横向为主（系统左右滑出按钮靠的就是这种连续横向滚动）：
+        // 记一个截止时刻，这期间不许冻住，否则蓝块会停在滑动前的位置，松手才"啪"地跳过去
+        if ScrollGestureAxis.isHorizontal(deltaX: event.scrollingDeltaX,
+                                         deltaY: event.scrollingDeltaY) {
+            // 0.5s 足够盖住惯性尾巴和松手回弹；每来一个事件都会往后推
+            horizontalUntil = now + 0.5
+        }
     }
 
     private func tick() {
-        guard let window, window.isVisible, bounds.width > 1 else { return }
+        // 窗口不可见（面板被 orderOut）、自己所在的那一层被藏起来（另一个页签）、
+        // 或者还没布局出尺寸：一帧都不该干活，而且要把已点亮的行熄掉。
+        guard let window, window.isVisible, bounds.width > 1, effectivelyVisible else {
+            suspend()
+            return
+        }
         let now = ProcessInfo.processInfo.systemUptime
+        if HoverBarView.fpsDebug, page == 0 { noteFrameGap(now) }
         // dt 卡上限：偶尔卡一帧也不会让弹簧冲出去
         let dt = min(max(now - lastFrameTime, 1.0 / 240.0), 0.05)
         lastFrameTime = now
 
-        // 滚动中：蓝块原地冻住，这一帧不去找行、不动画、也不碰 SwiftUI。
-        // 滚动是主线程最忙的时候（列表还在换行），每帧省一次全锚点遍历和行高亮切换
-        if shown, now - lastScrollTime < 0.15 {
+        // 竖滚中：蓝块原地冻住，这一帧不去找行、不动画、也不碰 SwiftUI。
+        // 滚动是主线程最忙的时候（列表还在换行），每帧省一次全锚点遍历和行高亮切换。
+        // 横滑例外：那是在滑开行、行本身在横移，冻住就会错位（见 horizontalUntil）
+        if shown, now - lastScrollTime < 0.15, now >= horizontalUntil {
             velocityY = 0
+            velocityX = 0
+            velocityW = 0
             springTargetY = springY
             return
         }
@@ -343,7 +434,16 @@ final class HoverBarView: NSView {
             return
         }
 
-        guard let hit = RowAnchorStore.shared.hit(at: inWindow, page: page) else {
+        // 横滑中行会被推开（右边滑出按钮 → 行内容整体右移，锚点从 14 缩到 126），
+        // 这时指针脚下可能「暂时没有行了」—— 但用户明明还在这一行上滑。
+        // 这期间认住原来那一行，别让蓝块在滑到一半时淡出。
+        let swipingNow = now < horizontalUntil || now - lastScrollTime < 0.15
+        var target: RowAnchorView? = RowAnchorStore.shared.hit(at: inWindow, page: page)
+        if target == nil, swipingNow, let held = hovered, held.window != nil {
+            target = held
+        }
+
+        guard let hit = target else {
             // 还在页里却没压到行：行间隙、组标题，或者滚动中行视图正在换。
             // 先原地停住别淡出，超过 0.35s 还是抓不到才收起来
             if shown {
@@ -354,12 +454,14 @@ final class HoverBarView: NSView {
             return
         }
         missingSince = 0
-        setHovered(hit)
 
         let rect = convert(hit.convert(hit.bounds, to: nil), from: nil)
             .insetBy(dx: 0, dy: 1)
             .intersection(bounds)
+        // 几何不成立时不能先点亮文字：那正是「白字、没有蓝底」的另一种来源
+        //（行被面板边缘裁掉、只剩一条窄缝时就会走到这里）。
         guard !rect.isNull, rect.width > 2, rect.height > 2 else { return }
+        setHovered(hit)
 
         if !shown {
             shown = true
@@ -368,13 +470,31 @@ final class HoverBarView: NSView {
             velocityY = 0
             springTargetY = rect.minY
             lastTargetY = rect.minY
+            lastHeight = rect.height
+            springX = rect.minX
+            springW = rect.width
+            velocityX = 0
+            velocityW = 0
             block.isHidden = false
-            block.frame = CGRect(x: rect.minX, y: springY, width: rect.width, height: rect.height)
+            block.frame = CGRect(x: springX, y: springY, width: springW, height: rect.height)
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0.10
                 self.block.animator().alphaValue = 1
             }
             return
+        }
+
+        // 行高突变（点开/收起更新说明，一帧到位、没有补间动画）：位置不能还挂在
+        // 弹簧里慢慢追，那会拼出一个「旧位置 + 新高度」的蓝方块。
+        // 判据加上「指针没动」：指针在动说明是换行，那种该走弹簧。
+        let heightJump = abs(rect.height - lastHeight) > 1
+        lastHeight = rect.height
+        if heightJump, !pointerMoved {
+            springY = rect.minY
+            velocityY = 0
+            springTargetY = rect.minY
+            lastTargetY = rect.minY
+            wasScrolling = false
         }
 
         let scrolling = (!pointerMoved && lastTargetY.isFinite && abs(rect.minY - lastTargetY) > 0.05)
@@ -417,7 +537,109 @@ final class HoverBarView: NSView {
                 }
             }
         }
-        block.frame = CGRect(x: rect.minX, y: springY, width: rect.width, height: rect.height)
+        advanceHorizontal(dt: dt, targetX: rect.minX, targetW: rect.width,
+                          direct: now < horizontalUntil)
+        block.frame = CGRect(x: springX, y: springY, width: springW, height: rect.height)
+
+        // 调试：`defaults write com.hushixiong.sentry UR_DEBUG_HOVER -bool YES` 后
+        // 每帧把「锚点要的矩形 / 蓝块实际摆的矩形」追加到 /tmp/hoverbar.log。
+        // 排查「展开说明时蓝块跳一下、还多出方框」这类几何问题，看日志比看录屏准。
+        if UserDefaults.standard.bool(forKey: "UR_DEBUG_HOVER") {
+            let line = String(format: "t=%.3f key=%@ rect=(x%.1f w%.1f y%.1f h%.1f) spring=(x%.1f w%.1f) sy=%.1f block=(x%.1f w%.1f y%.1f h%.1f) jump=%d mov=%d hsw=%d\n",
+                              now, hit.anchorKey, rect.minX, rect.width, rect.minY, rect.height,
+                              springX, springW, springY,
+                              block.frame.minX, block.frame.width,
+                              block.frame.minY, block.frame.height,
+                              heightJump ? 1 : 0, pointerMoved ? 1 : 0,
+                              now < horizontalUntil ? 1 : 0)
+            HoverBarView.appendDebug(line)
+        }
+    }
+
+    /// 横向跟随：连续横滑时直接跟（拖拽不能有滞后），其余时候走一根很硬的弹簧。
+    ///
+    /// 为什么不能一直直接赋值：行被滑开的那一瞬锚点会 `x14 w336 → x126 w238` 一帧跳过去，
+    /// 直接赋值看着就是「预选框啪地跳一下」；也不能一直写死 —— 那行内容滑走后
+    /// 预选框还停在原地，滑出来的按钮被压在蓝块底下，就是「跟不好」。
+    private func advanceHorizontal(dt: TimeInterval, targetX: CGFloat, targetW: CGFloat, direct: Bool) {
+        if !springX.isFinite {
+            springX = targetX
+            springW = targetW
+            velocityX = 0
+            velocityW = 0
+            return
+        }
+        if direct {
+            springX = targetX
+            springW = targetW
+            velocityX = 0
+            velocityW = 0
+            return
+        }
+        let omega: CGFloat = 42
+        let zeta: CGFloat = 1.0
+        velocityX += (omega * omega * (targetX - springX) - 2 * zeta * omega * velocityX) * dt
+        springX += velocityX * dt
+        velocityW += (omega * omega * (targetW - springW) - 2 * zeta * omega * velocityW) * dt
+        springW += velocityW * dt
+        if abs(targetX - springX) < 0.2, abs(velocityX) < 2 {
+            springX = targetX
+            velocityX = 0
+        }
+        if abs(targetW - springW) < 0.2, abs(velocityW) < 2 {
+            springW = targetW
+            velocityW = 0
+        }
+    }
+
+    /// 调试文本先攒在内存里，退出时一次性落盘。
+    /// 每 0.5s 开一次文件写一行本身就会在主线程上抖一下，
+    /// 会污染「滚动掉帧」的测量结果。
+    static var debugBuffer: [String] = []
+
+    static func flushDebug() {
+        guard !debugBuffer.isEmpty else { return }
+        let text = debugBuffer.joined()
+        debugBuffer.removeAll()
+        try? text.data(using: .utf8)?.write(to: URL(fileURLWithPath: "/tmp/hoverbar.log"))
+    }
+
+    private static func appendDebug(_ line: String) {
+        debugBuffer.append(line)
+    }
+
+    // MARK: - 掉帧采样（仅 UR_DEBUG_FPS=1 时）
+
+    static let fpsDebug = ProcessInfo.processInfo.environment["UR_DEBUG_FPS"] == "1"
+    private var fpsPrev: TimeInterval = 0
+    private var fpsWindowStart: TimeInterval = 0
+    private var fpsCount = 0
+    private var fpsSum = 0.0
+    private var fpsMax = 0.0
+    private var fpsDrops = 0
+
+    /// 60Hz 的 Timer 本身就会被主线程的活拖慢，所以「相邻两次 tick 的间隔」
+    /// 正好就是主线程的卡顿：>20ms 记一次掉帧（60fps 的预算 16.7ms）。
+    private func noteFrameGap(_ now: TimeInterval) {
+        defer { fpsPrev = now }
+        guard fpsPrev > 0 else { fpsWindowStart = now; return }
+        let gap = now - fpsPrev
+        if fpsWindowStart == 0 { fpsWindowStart = now }
+        fpsCount += 1
+        fpsSum += gap
+        fpsMax = max(fpsMax, gap)
+        if gap > 0.020 { fpsDrops += 1 }
+        if now - fpsWindowStart >= 0.5 {
+            let line = String(format: "frames=%d avg=%.1fms max=%.1fms drops=%d\n",
+                              fpsCount, fpsSum / Double(max(fpsCount, 1)) * 1000,
+                              fpsMax * 1000, fpsDrops)
+            HoverBarView.appendDebug(line)
+            fpsWindowStart = now
+            fpsCount = 0
+            fpsSum = 0
+            fpsMax = 0
+            fpsDrops = 0
+        }
     }
 
     /// 停滚后立刻贴合：指数收敛，约 4 帧（~70ms）到位。
@@ -430,18 +652,25 @@ final class HoverBarView: NSView {
     }
 
     private func setHovered(_ view: RowAnchorView) {
-        guard hovered !== view else { return }
-        let old = hovered?.box
+        let box = view.box
+        // 不能只比 view 的身份：List 复用行宿主时，同一个锚点的 box 会被换成另一行的。
+        // 只比身份就会「认为已经点亮过了」而直接 return，结果新行不亮、旧行一直亮着。
+        guard hovered !== view || litBox !== box else { return }
         hovered = view
-        view.box?.on = true
-        if let old, old !== view.box { old.on = false }
+        if litBox !== box {
+            litBox?.on = false
+            litBox = box
+        }
+        if box?.on != true { box?.on = true }
     }
 
     private func dismiss() {
-        if let box = hovered?.box { box.on = false }
-        hovered = nil
+        clearHover()
         velocityY = 0
         lastTargetY = .nan
+        lastHeight = 0
+        velocityX = 0
+        velocityW = 0
         missingSince = 0
         wasScrolling = false
         guard shown else { return }
@@ -477,16 +706,42 @@ private struct RowGroup {
     let rows: [AppRow]
 }
 
-private func byName(_ a: AppRow, _ b: AppRow) -> Bool {
-    a.app.name.localizedStandardCompare(b.app.name) == .orderedAscending
+/// 按当前排序方式取比较函数。三个选项各按各的依据：
+/// - 名称：localizedStandardCompare，中文按拼音，跟访达里看到的一致
+/// - 最近使用：Spotlight 的 kMDItemLastUsedDate，最近开过的在前
+/// - 安装时间：.app 的创建时间，最近装的在前
+private func sorter(_ mode: SortMode) -> (AppRow, AppRow) -> Bool {
+    switch mode {
+    case .name:
+        return { $0.app.name.localizedStandardCompare($1.app.name) == .orderedAscending }
+    case .recent:
+        return { a, b in
+            // 从没启动过、或 Spotlight 没索引到的没有时间，统一排最后；时间相同再按名字
+            let x = a.app.lastUsedAt ?? .distantPast
+            let y = b.app.lastUsedAt ?? .distantPast
+            if x == y { return a.app.name.localizedStandardCompare(b.app.name) == .orderedAscending }
+            return x > y
+        }
+    case .installed:
+        return { a, b in
+            // 从别处拷来的包没有创建时间，统一排最后；时间相同再按名字，顺序才稳定
+            let x = a.app.installedAt ?? .distantPast
+            let y = b.app.installedAt ?? .distantPast
+            if x == y { return a.app.name.localizedStandardCompare(b.app.name) == .orderedAscending }
+            return x > y
+        }
+    }
 }
 
-/// 「可更新」页的行：只列有新版本的，按名字排
+/// 「可更新」页的行：只列有新版本的，按当前排序方式排
 @MainActor
 private func computeVisibleRows(_ service: UpdateService, _ ui: UIState) -> [AppRow] {
     service.rows
         .filter { !service.settings.ignored.contains($0.id) && $0.isUpdate }
-        .sorted(by: byName)
+        // 搜索词也要筛这一页：以前只有「其他」页筛，在「可更新」里打字列表纹丝不动，
+        // 看着就像搜索坏了（搜索框是两个页签共用的）
+        .filter { ui.query.isEmpty || $0.app.name.localizedCaseInsensitiveContains(ui.query) }
+        .sorted(by: sorter(service.settings.sort))
 }
 
 /// 顺序照用户要的：可更新 → 已是最新 → 无检测源 → 检测失败（放最后）→ 已忽略
@@ -503,13 +758,14 @@ private func computeRowGroups(_ service: UpdateService, _ ui: UIState) -> [RowGr
     if !ui.query.isEmpty {
         base = base.filter { $0.app.name.localizedCaseInsensitiveContains(ui.query) }
     }
-    let ignored = base.filter { ignoredIds.contains($0.id) }.sorted(by: byName)
+    let order = sorter(service.settings.sort)
+    let ignored = base.filter { ignoredIds.contains($0.id) }.sorted(by: order)
     let live = base.filter { !ignoredIds.contains($0.id) }
     var groups = [
-        RowGroup(key: "update", title: "可更新", rows: live.filter { $0.status == .updateAvailable }.sorted(by: byName)),
-        RowGroup(key: "latest", title: "已是最新", rows: live.filter { $0.status == .upToDate }.sorted(by: byName)),
-        RowGroup(key: "unknown", title: "无检测源", rows: live.filter { $0.status == .unknown }.sorted(by: byName)),
-        RowGroup(key: "failed", title: "检测失败", rows: live.filter { $0.status == .failed }.sorted(by: byName)),
+        RowGroup(key: "update", title: "可更新", rows: live.filter { $0.status == .updateAvailable }.sorted(by: order)),
+        RowGroup(key: "latest", title: "已是最新", rows: live.filter { $0.status == .upToDate }.sorted(by: order)),
+        RowGroup(key: "unknown", title: "无检测源", rows: live.filter { $0.status == .unknown }.sorted(by: order)),
+        RowGroup(key: "failed", title: "检测失败", rows: live.filter { $0.status == .failed }.sorted(by: order)),
         RowGroup(key: "ignored", title: "已忽略", rows: ignored),
     ]
     // 这一页叫「其他」，平时就不列有更新的 App（它们在上一个页签里）；
@@ -576,7 +832,7 @@ struct ContentView: View {
                     ))
             }
         }
-        .frame(width: 364, height: 548)
+        .frame(width: PanelMetrics.width, height: PanelMetrics.height)
         .clipped()
         .animation(.snappy(duration: 0.26), value: ui.showSettings)
         .animation(.snappy(duration: 0.26), value: ui.showAbout)
@@ -614,7 +870,7 @@ struct ContentView: View {
     /// 返回用文字胶囊，右边圆钮仍然交给系统玻璃。
     private var settingsFooter: some View {
         HStack(spacing: 8) {
-            backCapsule(help: "回到更新列表") { ui.showSettings = false }
+            backCapsule { ui.showSettings = false }
 
             Text("版本 \(updater.currentVersion)")
                 .font(.system(size: 10.5))
@@ -623,13 +879,13 @@ struct ContentView: View {
 
             Spacer(minLength: 0)
 
-            footerButton("ellipsis", help: "关于") {
+            footerButton("ellipsis") {
                 ui.aboutFromSettings = true
                 // 设置页收起来：两页都透明底色，叠在一起会透出下面的设置内容
                 ui.showSettings = false
                 ui.showAbout = true
             }
-            footerButton("power", help: "退出 Sentry") { onQuit() }
+            footerButton("power") { onQuit() }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -745,18 +1001,18 @@ struct ContentView: View {
     private var aboutFooter: some View {
         HStack(spacing: 8) {
             // 从设置页翻过来的，返回就落回设置页；从列表翻过来的，返回就落回列表
-            backCapsule(help: "返回上一页") {
+            backCapsule {
                 ui.showAbout = false
                 if ui.aboutFromSettings { ui.showSettings = true }
             }
             Spacer(minLength: 0)
-            footerButton("power", help: "退出 Sentry") { onQuit() }
+            footerButton("power") { onQuit() }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
     }
 
-    private func backCapsule(help: String, action: @escaping () -> Void) -> some View {
+    private func backCapsule(action: @escaping () -> Void) -> some View {
         Button(action: action) {
             HStack(spacing: 4) {
                 Image(systemName: "chevron.left")
@@ -770,7 +1026,6 @@ struct ContentView: View {
             .contentShape(Capsule())
         }
         .modifier(GlassCapsuleButton())
-        .help(help)
     }
 
     private var appBuild: String {
@@ -828,7 +1083,9 @@ struct ContentView: View {
 
     // MARK: - 分段
 
-    private static let barControlHeight: CGFloat = 26      // 分段轨道和搜索框的统一高度
+    private static let barControlHeight: CGFloat = 26      // 分段轨道、按钮和搜索框的统一高度
+    /// 顶栏右侧两颗按钮各占一半：(94 - 5) / 2。94 = 底栏三颗圆钮那一排的宽度（26×3 + 8×2）
+    private static let halfControlWidth: CGFloat = (barControlHeight * 3 + 16 - 5) / 2
 
     private var tabBar: some View {
         HStack(spacing: 8) {
@@ -846,41 +1103,53 @@ struct ContentView: View {
 
             Spacer(minLength: 0)
 
-            // 搜索框常驻：两个页签下都在，⌘F 随时能落到它上面。
-            // 宽度跟右下三颗圆钮那一排同宽（26×3 + 间距 8×2 = 94），右边缘齐平。
-            HStack(spacing: 5) {
-                Image(systemName: "magnifyingglass")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                SearchField(ui: ui)
-                    .frame(maxWidth: .infinity)
-                // 清除按钮的位置常驻（没字的时候只是透明）：一出现一消失，
-                // 整条胶囊的宽度就会跟着跳一下，段落轨道也会跟着挤。
-                Button {
-                    ui.applySearch("")
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+            // 一颗排序、一颗搜索，两颗平分这一块。
+            // 整块宽度跟右下三颗圆钮那一排同宽（26×3 + 间距 8×2 = 94），高度 26、右边缘齐平 ——
+            // 位置和宽度都跟换掉的那条常驻搜索框完全一致。
+            //
+            // 两种状态叠在一起做交叉淡入：两颗按钮淡出＋轻微内收，输入框淡入，
+            // 都锚在右边缘，看上去就是同一块玻璃换了内容，而不是「跳一下」。
+            // 收起只有一条判据 —— ui.searchActive：点面板里别处、Esc、⌘F 都只改它。
+            // （以前还额外要求 !query.isEmpty，于是打过字之后输入框就再也收不回去，
+            //   顶栏一直被它占着，排序图标看不见。）
+            ZStack(alignment: .trailing) {
+                HStack(spacing: 5) {
+                    sortButton
+                        .frame(width: Self.halfControlWidth, height: Self.barControlHeight)
+                    searchButton
+                        .frame(width: Self.halfControlWidth, height: Self.barControlHeight)
                 }
-                .buttonStyle(.plain)
-                .opacity(ui.query.isEmpty ? 0 : 1)
-                .disabled(ui.query.isEmpty)
-                .help("清除搜索")
+                .opacity(ui.searchActive ? 0 : 1)
+                .scaleEffect(ui.searchActive ? 0.9 : 1, anchor: .trailing)
+                // 收起时（searchActive=false）按钮淡入得慢一点，撑住这 0.16 秒的空档；
+                // 展开时先快点让开（0.09 秒），别和输入框叠在一起显脏
+                .animation(ui.searchActive ? .easeOut(duration: 0.09) : .easeOut(duration: 0.16),
+                           value: ui.searchActive)
+                .allowsHitTesting(!ui.searchActive)
+
+                if ui.searchActive {
+                    searchFieldBar
+                        // 错开一拍再淡入：两边同时半透明的话，三条横线会从「搜索」两个字里透出来，
+                        // 中间那几帧又糊又乱。先让按钮退干净，输入框再浮出来。
+                        .transition(.asymmetric(
+                            insertion: .opacity.animation(.easeIn(duration: 0.15).delay(0.04)),
+                            removal: .opacity.animation(.easeOut(duration: 0.08))
+                        ))
+                }
             }
-            .padding(.horizontal, 10)
             .frame(width: Self.barControlHeight * 3 + 16, height: Self.barControlHeight)
-            .modifier(GlassSearchField())
         }
         .padding(.horizontal, 14)
         .padding(.top, 12)
         .padding(.bottom, 8)
-        // 最近搜索：贴在搜索框正下方，只在「正在搜索、还没打字、有历史」时出现
+        // 最近搜索：贴在搜索框正下方，只在「正在搜索、还没打字、有历史」时出现。
+        // 用 padding 而不是 offset 往下推：offset 是渲染期的位移，不会写进布局，
+        // 底下那个上报窗口坐标的探针就会拿到偏移前的位置（判断「点没点在浮层里」会错位）。
         .overlay(alignment: .topTrailing) {
             if ui.searchActive, ui.query.isEmpty, !ui.recentSearches.isEmpty {
                 recentSearchesPanel
                     .padding(.trailing, 14)
-                    .offset(y: Self.barControlHeight + 18)
+                    .padding(.top, Self.barControlHeight + 18)
             }
         }
         // 动画只挂在 tabPreview 上（见那里）：之前挂在整条 HStack 上，
@@ -891,6 +1160,114 @@ struct ContentView: View {
         .onChange(of: ui.tab) {
             if ui.keyRow != nil { ui.keyRow = nil }
         }
+        // 两颗按钮是淡出藏起来的（不是移除），藏起来时收不到 onHover(false)，
+        // 悬停色会留在开关上：等搜索框收起、按钮再淡回来时，就凭空亮着一颗。
+        .onChange(of: ui.searchActive) {
+            ui.sortHover.on = false
+            ui.searchHover.on = false
+        }
+    }
+
+    // MARK: - 顶栏右侧：排序 / 搜索
+
+    /// 两颗按钮里的符号。尺寸和重心对齐分段控件的文字，别让图标看着比字大。
+    /// active 用来标「有筛选词还生效」：搜索框收起之后，只剩这颗图标能提示列表被筛过。
+    private func barGlyph(_ name: String, active: Bool = false) -> some View {
+        Image(systemName: name)
+            .font(.system(size: 11.5, weight: .medium))
+            .foregroundStyle(active ? Color.accentColor : Color.secondary)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(Rectangle())
+    }
+
+    /// 顶栏两颗按钮共用的玻璃底。
+    /// 排序那颗必须画在 Menu **外面**：Menu 会自己重绘 label，加在 label 上的
+    /// glassEffect 会被吃掉 —— 实测只剩一个图标浮在那儿，跟旁边的搜索按钮不成对。
+    @ViewBuilder private var barGlass: some View {
+        if #available(macOS 26.0, *) {
+            Rectangle()
+                .fill(Color.clear)
+                .glassEffect(.regular.interactive(), in: .capsule)
+        } else {
+            Capsule()
+                .fill(Color.primary.opacity(0.06))
+                .overlay(Capsule().strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.8))
+        }
+    }
+
+    /// 排序按钮：点开是系统菜单。用 SwiftUI 的 Menu 而不是自己弹 NSMenu ——
+    /// 这里只是三条单选项，系统菜单的勾选态、明暗、键盘操作都是现成的，没必要自绘。
+    private var sortButton: some View {
+        ZStack {
+            barGlass
+            Menu {
+                ForEach(SortMode.allCases, id: \.self) { mode in
+                    Button {
+                        service.setSort(mode)
+                    } label: {
+                        if service.settings.sort == mode {
+                            Label(mode.title, systemImage: "checkmark")
+                        } else {
+                            Text(mode.title)
+                        }
+                    }
+                }
+            } label: {
+                barGlyph("line.3.horizontal.decrease")
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+        }
+        .frame(width: Self.halfControlWidth, height: Self.barControlHeight)
+        .contentShape(Capsule())
+        .modifier(BarHoverTint(box: ui.sortHover))
+        .onHover { ui.sortHover.on = $0 }
+    }
+
+    private var searchButton: some View {
+        Button {
+            // 输入框这时还不在视图树里，先把搜索态打开，等它建出来再要焦点
+            ui.searchActive = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+                NotificationCenter.default.post(name: .updateRadarFocusSearch, object: nil)
+            }
+        } label: {
+            // 过滤词还在（收起了输入框、列表仍是筛过的）时，放大镜染成强调色
+            barGlyph("magnifyingglass", active: !ui.query.isEmpty)
+                .frame(width: Self.halfControlWidth, height: Self.barControlHeight)
+                .modifier(GlassSearchField())
+        }
+        .buttonStyle(.plain)
+        .modifier(BarHoverTint(box: ui.searchHover))
+        .onHover { ui.searchHover.on = $0 }
+    }
+
+    /// 搜索态：整块 94 宽换回输入框，跟换成按钮之前完全一样（同位置、同宽度、同玻璃）
+    private var searchFieldBar: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "magnifyingglass")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            SearchField(ui: ui)
+                .frame(maxWidth: .infinity)
+            // 清除按钮的位置常驻（没字的时候只是透明）：一出现一消失，
+            // 整条胶囊的宽度就会跟着跳一下，段落轨道也会跟着挤。
+            Button {
+                ui.applySearch("")
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .opacity(ui.query.isEmpty ? 0 : 1)
+            .disabled(ui.query.isEmpty)
+        }
+        .padding(.horizontal, 10)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .modifier(GlassSearchField())
+        // 把这一整条胶囊的窗口坐标报出去：点在它上面（放大镜、文字、清除钮）不算「点别处」
+        .background(WindowRectReporter { SearchHitAreas.shared.bar = $0 })
     }
 
     /// 搜索框下面的「最近搜索」浮层。宽度比搜索框宽一些，右边缘与搜索框对齐。
@@ -905,7 +1282,6 @@ struct ContentView: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .buttonStyle(.plain)
-                    .help("清空最近搜索")
             }
             .padding(.horizontal, 11)
             .padding(.top, 9)
@@ -935,6 +1311,7 @@ struct ContentView: View {
         .frame(width: 210)
         .padding(.bottom, 7)
         .modifier(GlassCard())
+        .background(WindowRectReporter { SearchHitAreas.shared.recent = $0 })
         .zIndex(2)
     }
 
@@ -1078,17 +1455,16 @@ struct ContentView: View {
             .buttonStyle(.plain)
             .onHover { ui.scanHover.on = $0 }
             .disabled(service.checking)
-            .help(service.checking ? "正在扫描" : "立即扫描")
 
             Spacer()
 
             // 「关于 → 设置 → 退出」顺序，跟参考图同一套排列
-            footerButton("ellipsis", help: "关于") {
+            footerButton("ellipsis") {
                 ui.aboutFromSettings = false
                 ui.showAbout = true
             }
-            footerButton("gearshape", help: "设置") { ui.showSettings = true }
-            footerButton("power", help: "退出 Sentry") { onQuit() }
+            footerButton("gearshape") { ui.showSettings = true }
+            footerButton("power") { onQuit() }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -1098,13 +1474,11 @@ struct ContentView: View {
     /// 内容框 18pt + 系统补充的 8pt = 画出来 26pt，和原来的尺寸一致
     private func footerButton(_ systemName: String,
                               spinning: Bool = false,
-                              help: String,
                               action: @escaping () -> Void) -> some View {
         Button(action: action) {
             footerGlyph(systemName, spinning: spinning)
         }
         .modifier(GlassCircleButton())
-        .help(help)
     }
 
     private func footerGlyph(_ systemName: String, spinning: Bool) -> some View {
@@ -1192,8 +1566,7 @@ private struct ListPage: View {
     }
 
     var body: some View {
-        GeometryReader { geo in
-            let viewHeight = geo.size.height
+        GeometryReader { _ in
             ScrollViewReader { proxy in
                 // 共用高亮条压在 List 底下（行的背景是透明的），
                 // 所以划过一行时看到的是同一块蓝底滑过去，而不是上一行灭、下一行亮
@@ -1248,20 +1621,13 @@ private struct ListPage: View {
                     proxy.scrollTo(id, anchor: .center)
                 }
             }
-            // 点开一行时，只有说明会长到面板外面才滚一下；本来整行就在视野里就不动，
-            // 免得点一下整页跳一格
-            .onChange(of: ui.expanded) {
-                guard index == ui.tab,
-                      let id = ui.lastToggled,
-                      ui.expanded.contains(id) else { return }
-                // 等这一帧长高之后再看位置，不然量到的还是展开前的高度
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
-                    guard let rect = ui.rowFramesByTab[ui.tab]?[id], rect.maxY > viewHeight - 4 else { return }
-                    withAnimation(.easeInOut(duration: 0.18)) {
-                        proxy.scrollTo(id, anchor: .bottom)
-                    }
-                }
-            }
+            // 点开一行时**不滚动列表**。
+            // 之前这里会在「说明长到面板外」时 scrollTo(.bottom)：点一下靠下的行，
+            // 整列就往上顶一截（实测 PDF Squeezer 那行从 y46 顶到 y1、首行从 Mole
+            // 变成 Logic Pro），看着就是「内容跳了一下」。现在展开只让这一行自己长高，
+            // 列表位置完全不动；看不到底部的说明，用户自己滚一下即可。
+            // （keyRow 也不再在点击时设置，见 rowsSection 的 onToggle——两个会自动
+            //  滚动的入口都关掉，点简介才真正做到「原地展开」。）
             // 系统的滚动边缘效果：滑到顶/底时，被条遮住的那一段由系统做渐隐，
             // 不是我们自己画的渐变，所以深浅色、壁纸、透明度都跟系统一致。
             .modifier(ScrollEdgeBlur())
@@ -1294,12 +1660,17 @@ private struct ListPage: View {
                     // 分隔线自己画：系统的会铺满整行，从图标左边就起，跟名字对不齐
                     showsDivider: index < rows.count - 1,
                     onToggle: {
-                        // 点这一行只展开/收起更新说明。选中框已经去掉，
-                        // keyRow 只留给键盘 ↑↓ 记住当前行，不再画任何底色
-                        ui.keyRow = row.id
-                        withAnimation(.easeInOut(duration: 0.16)) { ui.toggleExpanded(row.id) }
+                        // 点这一行只展开/收起更新说明，**不要动 keyRow**：
+                        // keyRow 一变，下面的 .onChange 就会 scrollTo(.center)，
+                        // 把整列往上顶一截 —— 用户看着就是「点简介时内容跳了一下」。
+                        // keyRow 现在只留给键盘 ↑↓ 和通知深链（见 urRevealRow）。
+                        // 也不包 withAnimation：点开/收起是即时的，跟切页签、
+                        // 换行、展开全部一致；List 行高本来就一帧到位，包一层
+                        // 反而会让文字颜色抢先跳变、和行高不同步。
+                        ui.toggleExpanded(row.id)
                     },
-                    // 行自己上报位置：列表用它判断展开说明要不要滚一下
+                    // 键盘 ↑↓ 要按纵坐标排序，所有行都报位置（原来的做法是只报展开行，
+                    // 为了省滚动时的测量开销 —— 但键盘导航依赖完整列表，只能都报）
                     onFrame: { ui.rowFramesByTab[tabIndex, default: [:]][row.id] = $0 })
             .listRowInsets(EdgeInsets())
             .listRowBackground(Color.clear)
@@ -1313,7 +1684,8 @@ private struct ListPage: View {
             // 滑动操作用系统的 swipeActions：跟手位移、越界回弹、松手动画都是 SwiftUI 自己做的。
             // 按钮里只放文字：用 Label 的话系统会把图标塞进胶囊、标题甩到胶囊外面，
             // 行又比系统默认行高得多，那个大胶囊 + 底下孤零零一行字就是最丑的地方。
-            // 高度固定 56 = 图标 40 + 上下内边距 8×2，让滑出来的胶囊跟整行一样高
+            // 高度不再写死：行高 = 图标 40 + 上下内边距 4×2 = 48，
+            // 滑出来的胶囊由系统按行高自己撑，改行内边距时不用同步这里
             .swipeActions(edge: .leading, allowsFullSwipe: true) {
                 if row.isUpdate {
                     Button { service.dismiss(row) } label: {
@@ -1356,31 +1728,37 @@ private struct ListPage: View {
 
     private func groupHeader(_ group: RowGroup) -> some View {
         let collapsed = isCollapsed(group.key)
-        return Button {
-            ui.collapsedGroups[group.key] = !(ui.collapsedGroups[group.key] ?? false)
-        } label: {
-            HStack(spacing: 5) {
-                Image(systemName: "chevron.right")
-                    .font(.caption2.weight(.bold))
-                    .imageScale(.small)
-                    .foregroundStyle(.tertiary)
-                    .rotationEffect(.degrees(collapsed ? 0 : 90))
-                Text(group.title)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Text("\(group.rows.count)")
-                    .font(.footnote)
-                    .monospacedDigit()
-                    .foregroundStyle(.tertiary)
-                Spacer(minLength: 0)
-            }
-            .padding(.leading, 12)
-            .padding(.trailing, 18)
-            .padding(.top, 10)
-            .padding(.bottom, 4)
-            .contentShape(Rectangle())
+        // 点击手势而不是 Button：组标题滚到跟前才建，Button 的控件/焦点链
+        // 同样是滚动时的尖峰来源（跟行内 Button 一个道理）。
+        return HStack(spacing: 5) {
+            Image(systemName: "chevron.right")
+                .font(.caption2.weight(.bold))
+                .imageScale(.small)
+                .foregroundStyle(.tertiary)
+                .rotationEffect(.degrees(collapsed ? 0 : 90))
+            Text(group.title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Text("\(group.rows.count)")
+                .font(.footnote)
+                .monospacedDigit()
+                .foregroundStyle(.tertiary)
+            Spacer(minLength: 0)
         }
-        .buttonStyle(.plain)
+        .padding(.leading, 12)
+        .padding(.trailing, 18)
+        .padding(.top, 10)
+        .padding(.bottom, 4)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            ui.collapsedGroups[group.key] = !(ui.collapsedGroups[group.key] ?? false)
+        }
+        .accessibilityElement()
+        .accessibilityLabel("\(group.title)，\(group.rows.count) 个")
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction {
+            ui.collapsedGroups[group.key] = !(ui.collapsedGroups[group.key] ?? false)
+        }
     }
 }
 
@@ -1483,6 +1861,21 @@ private struct ScanHoverTint: ViewModifier {
         content.background {
             Capsule()
                 .fill(Color.primary.opacity(box.on ? 0.09 : 0))
+                .animation(.easeOut(duration: 0.12), value: box.on)
+        }
+    }
+}
+
+/// 顶栏「排序 / 搜索」的悬停明暗。跟 ScanHoverTint 同一个观感、同一份透明度，
+/// 区别只是叠在玻璃**上面**：这两颗的玻璃垫在 Menu / Button 底下，
+/// 指针事件被上面那层吃掉，interactive 的悬停高亮永远不亮。
+private struct BarHoverTint: ViewModifier {
+    @ObservedObject var box: HoverBox
+    func body(content: Content) -> some View {
+        content.overlay {
+            Capsule()
+                .fill(Color.primary.opacity(box.on ? 0.09 : 0))
+                .allowsHitTesting(false)
                 .animation(.easeOut(duration: 0.12), value: box.on)
         }
     }
@@ -1601,6 +1994,55 @@ private struct GlassCard: ViewModifier {
     }
 }
 
+/// 搜索态下「点这里不算点别处」的两块地方（窗口坐标）：搜索胶囊 + 最近搜索浮层。
+/// 布局一变就由 WindowRectReporter 刷新，本地鼠标监听器读它。
+/// 只存矩形、不发通知：它一变就重绘会把整条顶栏带进去。
+final class SearchHitAreas {
+    static let shared = SearchHitAreas()
+    var bar: CGRect?
+    var recent: CGRect?
+
+    /// 边缘各自外扩一点：圆角那几像素、玻璃外沿的一点点误差不该判成「点别处」
+    func contains(_ point: NSPoint) -> Bool {
+        if let bar, bar.insetBy(dx: -3, dy: -3).contains(point) { return true }
+        if let recent, recent.insetBy(dx: -3, dy: -3).contains(point) { return true }
+        return false
+    }
+}
+
+/// 一块区域的窗口坐标上报器：只量位置，不参与命中（hitTest 直接返回 nil）。
+private struct WindowRectReporter: NSViewRepresentable {
+    let onChange: (CGRect?) -> Void
+
+    final class Probe: NSView {
+        var onChange: ((CGRect?) -> Void)?
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            report()
+        }
+        override func layout() {
+            super.layout()
+            report()
+        }
+        func report() {
+            guard window != nil, superview != nil else { onChange?(nil); return }
+            onChange?(convert(bounds, to: nil))
+        }
+    }
+
+    func makeNSView(context: Context) -> Probe {
+        let probe = Probe()
+        probe.onChange = onChange
+        return probe
+    }
+
+    func updateNSView(_ probe: Probe, context: Context) {
+        probe.onChange = onChange
+        probe.report()
+    }
+}
+
 /// 搜索输入框包成 NSTextField，是为了两件 SwiftUI 做不到的事：
 /// 1) placeholder 的字号——SwiftUI 的 TextField 会把「搜索」按系统 13 号画，跟左边 11.5 号的分段不一致；
 /// 2) 中文输入法打字时，SwiftUI 的 binding 要等选字/回车才更新，自己画的占位文字就会一直压在拼音上面。
@@ -1612,7 +2054,46 @@ private struct SearchField: NSViewRepresentable {
         var parent: SearchField
         var focusObserver: NSObjectProtocol?
         var setObserver: NSObjectProtocol?
+        /// 点面板里别处就收起搜索态的监听器（只在输入框活着的时候挂着）
+        private var mouseMonitor: Any?
         init(_ parent: SearchField) { self.parent = parent }
+
+        /// 为什么用本地鼠标监听器，而不是在面板上垫一层透明手势：
+        /// 面板里能点的地方五花八门（分段、行、行内按钮、底栏），垫一层手势会把
+        /// 这些点击全吃掉，变成「点两下才生效」。监听器只看位置，不拦事件。
+        func installMouseMonitor(for field: NSTextField) {
+            guard mouseMonitor == nil else { return }
+            mouseMonitor = NSEvent.addLocalMonitorForEvents(
+                matching: [.leftMouseDown, .rightMouseDown]
+            ) { [weak self, weak field] event in
+                guard let self, let field, let window = field.window,
+                      event.window === window          // 别的窗口（比如菜单弹层）不归这里管
+                else { return event }
+                let point = event.locationInWindow
+                if SearchHitAreas.shared.contains(point) { return event }
+                // 探针还没报上坐标（刚建出来的那一两帧）：退回用输入框自己的框，
+                // 左右各放宽到整条胶囊（放大镜和清除钮都在里面）
+                if SearchHitAreas.shared.bar == nil {
+                    let fallback = field.convert(field.bounds, to: nil).insetBy(dx: -22, dy: -6)
+                    if fallback.contains(point) { return event }
+                }
+                self.collapse(field)
+                return event
+            }
+        }
+
+        /// 收起搜索态。先摘第一响应者再改状态 —— 跟 Esc 那条路同一个坑：
+        /// 直接让 SwiftUI 把输入框从视图树里摘掉的话，NSTextField 还处在编辑中，光标会飘。
+        /// 不动 query：只是把输入框收起来，筛过的列表保持原样，搜索图标会染色提示。
+        func collapse(_ field: NSTextField) {
+            guard parent.ui.searchActive else { return }
+            field.window?.makeFirstResponder(nil)
+            parent.ui.searchActive = false
+        }
+
+        deinit {
+            if let mouseMonitor { NSEvent.removeMonitor(mouseMonitor) }
+        }
 
         func controlTextDidChange(_ obj: Notification) {
             guard let field = obj.object as? NSTextField else { return }
@@ -1643,6 +2124,15 @@ private struct SearchField: NSViewRepresentable {
                 parent.ui.commitSearch(textView.string.isEmpty ? parent.ui.query : textView.string)
                 return true
             }
+            // Esc＝退出搜索态，退回顶栏那两颗按钮。
+            // 先卸掉第一响应者再改状态：直接让 SwiftUI 把输入框从视图树里摘掉，
+            // NSTextField 还处在编辑中，光标会飘到别的地方去。
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                control.window?.makeFirstResponder(nil)
+                parent.ui.applySearch("")
+                parent.ui.searchActive = false
+                return true
+            }
             return false
         }
     }
@@ -1655,6 +2145,8 @@ private struct SearchField: NSViewRepresentable {
         field.drawsBackground = false
         field.focusRingType = .none
         field.isEditable = true
+        // 收起时不清查筛选词：再点开搜索，框里得还是原来那个词（不然列表筛着、框却是空的）
+        field.stringValue = ui.query
         field.font = .systemFont(ofSize: 11.5)
         field.lineBreakMode = .byTruncatingTail
         field.cell?.usesSingleLineMode = true
@@ -1665,6 +2157,8 @@ private struct SearchField: NSViewRepresentable {
                          .foregroundColor: NSColor.secondaryLabelColor]
         )
         field.delegate = context.coordinator
+        // 点面板里别处 → 自动收起（见 Coordinator.installMouseMonitor）
+        context.coordinator.installMouseMonitor(for: field)
         // ⌘F 聚焦：面板由 AppDelegate 弹出后发通知，这里接住并把光标放进搜索框
         context.coordinator.focusObserver = NotificationCenter.default.addObserver(
             forName: .updateRadarFocusSearch, object: nil, queue: .main
@@ -1696,6 +2190,9 @@ private struct SearchField: NSViewRepresentable {
         if let token = coordinator.setObserver {
             NotificationCenter.default.removeObserver(token)
         }
+        // 输入框没了，报告出来的两块区域作废，免得下一轮点到旧位置还算「在搜索区里」
+        SearchHitAreas.shared.bar = nil
+        SearchHitAreas.shared.recent = nil
     }
 
     func updateNSView(_ field: NSTextField, context: Context) {
@@ -1771,10 +2268,56 @@ private struct AppIcon: NSViewRepresentable {
     }
 }
 
+/// 展开说明里「展开全部 / 收起」的状态。
+/// 这台机器只有 Command Line Tools，SwiftUI 的宏插件没有，`@State` 编不过，
+/// 所以跟 HoverBox 一样走一个小 ObservableObject，按 App id 记。
+final class NotesBox: ObservableObject {
+    static let shared = NotesBox()
+
+    /// 点过「展开全部」的行
+    @Published private(set) var expanded: Set<String> = []
+
+    func isExpanded(_ key: String) -> Bool { expanded.contains(key) }
+
+    func toggle(_ key: String) {
+        if expanded.contains(key) {
+            expanded.remove(key)
+        } else {
+            expanded.insert(key)
+        }
+    }
+
+    /// 行收起来时清干净：下次点开还是先看 8 行摘要
+    func forget(_ key: String) {
+        if expanded.contains(key) { expanded.remove(key) }
+    }
+}
+
+/// 每行说明文字的自然高度：只用来判断要不要给「展开全部」。
+/// 量到之后只通知**本行**重绘一次；不放进 NotesBox 单例（一发布会让所有行
+/// 重排，近百行滚动时能卡半秒），也不用 @State（本机缺 SwiftUI 宏插件，编不过）。
+final class RowMeasure: ObservableObject {
+    @Published private(set) var natural: CGFloat = 0
+
+    func set(_ h: CGFloat) {
+        // 同值不发布：量高只会触发一次重绘，不会来回抖成无限循环
+        if abs(natural - h) > 0.5 { natural = h }
+    }
+
+    /// List 会复用行视图：换了一个 App 就清掉上一个 App 的测量值
+    func reset() {
+        if natural != 0 { natural = 0 }
+    }
+}
+
 struct RowView: View {
     let row: AppRow
     let service: UpdateService
     @ObservedObject var hover: HoverBox
+    /// 「展开全部」的状态（见 NotesBox 的说明）
+    @ObservedObject private var notes = NotesBox.shared
+    /// 本行说明文字的自然高度：量到后只重绘这一行，用来决定要不要给「展开全部」
+    @StateObject private var measure = RowMeasure()
     /// 这一行的锚点名字：整页的高亮条靠它找到这一行的窗口坐标
     var anchorKey: String = ""
     var ignored: Bool = false
@@ -1783,89 +2326,106 @@ struct RowView: View {
     /// 行底要不要画分隔线（最后一行不画）
     var showsDivider: Bool = false
     var onToggle: () -> Void = {}
-    /// 展开时把自己在列表里的位置报给列表（列表用它判断要不要滚一下）
+    /// 把自己在列表里的位置报给 UIState，键盘 ↑↓ 按它排序（见 moveKeyRow）
     var onFrame: (CGRect) -> Void = { _ in }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        rowContent
+    }
+
+    private var rowContent: some View {
+        VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .center, spacing: 10) {
                 // 左半：图标 + 名字 + 版本 + 空白。点这片 = 展开/收起更新说明。
-                // 用真按钮（plain 样式、看不出按钮样）而不是 onTapGesture：
-                // 一是无障碍能用 VoiceOver/键盘点到，二是不会跟右边的「更新」按钮抢点击。
-                Button {
-                    onToggle()
-                } label: {
-                    HStack(alignment: .center, spacing: 10) {
-                        AppIcon(icons: row.app.icon)
-                            .frame(width: 40, height: 40)
+                // 这里用 onTapGesture 而不是 Button：Button 在 List 行里要建整套控件、
+                // 焦点和悬停跟踪，近百行滚动时每新露出一行都要付一遍，实测单这一项
+                // 就把滚动尖峰从 60ms 抬到 150ms。点击行为不变，无障碍用
+                // accessibilityAction 补回来，VoiceOver 照样能「按」这一行。
+                HStack(alignment: .center, spacing: 10) {
+                    AppIcon(icons: row.app.icon)
+                        .frame(width: PanelMetrics.iconSide, height: PanelMetrics.iconSide)
 
-                        VStack(alignment: .leading, spacing: 1) {
-                            // 字重跟系统菜单一致：正文普通体，不额外加粗
-                            Text(row.app.name)
-                                .font(.body)
-                                .foregroundStyle(hover.on ? Color.white : Color.primary)
-                                .lineLimit(1)
-                            Text(row.subtitle)
-                                .font(.footnote)
-                                .monospacedDigit()
-                                .foregroundStyle(hover.on ? Color.white.opacity(0.8) : Color.secondary)
-                                .lineLimit(1)
-                        }
-
-                        Spacer(minLength: 8)
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help(expanded ? "收起更新说明" : "看这个 App 这次的更新说明")
-
-                // 右半：状态字 / 「更新」按钮
-                if ignored {
-                    Button { onToggle() } label: {
-                        Text("已忽略")
+                    VStack(alignment: .leading, spacing: 1) {
+                        // 字重跟系统菜单一致：正文普通体，不额外加粗
+                        Text(row.app.name)
+                            .font(.body)
+                            .foregroundStyle(hover.on ? Color.white : Color.primary)
+                            .lineLimit(1)
+                        Text(row.subtitle)
                             .font(.footnote)
-                            .foregroundStyle(hover.on ? AnyShapeStyle(Color.white.opacity(0.75)) : AnyShapeStyle(.tertiary))
-                            .contentShape(Rectangle())
+                            .monospacedDigit()
+                            .foregroundStyle(hover.on ? Color.white.opacity(0.8) : Color.secondary)
+                            .lineLimit(1)
                     }
-                    .buttonStyle(.plain)
+
+                    Spacer(minLength: 8)
+                }
+                .contentShape(Rectangle())
+                .onTapGesture { onToggle() }
+                // 直接给 label，不走 children: .combine：combine 每次构建都要
+                // 遍历合并子树，近百行滚动时每新露一行都付一遍
+                .accessibilityElement()
+                .accessibilityLabel("\(row.app.name)，\(row.subtitle)")
+                .accessibilityAddTraits(.isButton)
+                .accessibilityAction { onToggle() }
+
+                // 右半：状态字 / 「更新」
+                if ignored {
+                    Text("已忽略")
+                        .font(.footnote)
+                        .foregroundStyle(hover.on ? AnyShapeStyle(Color.white.opacity(0.75)) : AnyShapeStyle(.tertiary))
+                        .contentShape(Rectangle())
+                        .onTapGesture { onToggle() }
                 } else if row.isUpdate {
+                    // 「更新」内部也已是点击手势（见 trailingContent），不再是 Button
                     trailing
                 } else {
-                    // 已是最新 / 检测失败 / 无检测源：这几个只是字，点一下也能展开说明。
-                    // 用 Button 而不是 onTapGesture：VoiceOver 才认得出这是一个可点的目标。
-                    Button { onToggle() } label: {
-                        trailing.contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
+                    // 已是最新 / 检测失败 / 无检测源：这几个只是字，点一下也能展开说明
+                    trailing
+                        .contentShape(Rectangle())
+                        .onTapGesture { onToggle() }
                 }
             }
+            // 头部这一行自己留上下 3pt 呼吸，不靠外层的 .frame(minHeight:46) 居中。
+            // 原来收起时外层把 40pt 图标居中在 46pt 行里（图标离行顶 3pt），展开后
+            // 内容超过 46pt 就不再居中，图标直接贴到行顶 —— 蓝框没动、图标上移 3pt，
+            // 看着就是「展开简介后预选框离图标更近」。两种状态都显式留 3pt 就一致了。
+            .padding(.vertical, PanelMetrics.rowVerticalPadding)
 
-            // 更新说明只在点开这一行之后才显示：收起的列表只留图标、名字、版本、状态，
-            // 名单一眼扫得完；想看这次更新了什么，左击这一行展开。
+            // 更新说明：点开整块出现、收起整块消失，不做补间动画。
+            // List（NSTableView）的行高本来就是一帧到位，硬加逐帧长高反而跟
+            // 列表里其他即时交互（切页签、换行、展开全部）不统一。
+            // 收起的行不建这一块：说明文字（几百字、可选中）是整行最贵的东西，
+            // 近百行滚动时每露一行都排一遍字，正是「其他」页卡顿的来源。
             if expanded {
                 notesBlock
+                    // 可选中只在真正显示时挂：这是行里最贵的部件
+                    .textSelection(.enabled)
             }
         }
         // 左右必须一样宽：之前右边多留 10pt 是为了躲滚动条，结果图标离左边 20pt、
         // 「更新」按钮离右边 23pt，看着就是歪的。外层的 8pt 已经够让滚动条错开了。
         .padding(.horizontal, 4)
-        .padding(.vertical, 8)
-        // 每行都把位置报给列表：展开说明时判断要不要滚一下。
-        // 只有展开着的行才需要这个位置，收起的行一个都不挂（滚动时每行每帧量一次坐标，
-        // 就是列表不跟手的主因之一）
+        // 收起行给**固定**高度 46：List 背后是 NSTableView，行高固定时它能走
+        // 「统一行高」的快速虚拟化路径，不用为每个新露出的行测量内容高度；
+        // 之前用 minHeight，每行都要量一次，近百行滚动时就是那些 100ms+ 的尖峰。
+        // 展开的那一行仍然让它自己撑高（一次只有一行展开，量一次无所谓）。
+        .frame(height: expanded ? nil : PanelMetrics.rowHeight)
+        // 报位置给键盘 ↑↓ 排序（点简介时的自动滚动已删，不再用它判断要不要滚）。
+        // 高亮条用下面这个 AppKit 锚点定位，不依赖这里的 SwiftUI 坐标。
         .background {
-            if expanded {
-                GeometryReader { g in
-                    Color.clear
-                        .onChange(of: g.frame(in: .named("urList")), initial: true) { _, rect in
-                            onFrame(rect)
-                        }
-                }
+            GeometryReader { g in
+                Color.clear
+                    .onChange(of: g.frame(in: .named("urList")), initial: true) { _, rect in
+                        onFrame(rect)
+                    }
             }
         }
         // 给高亮条定位的是这个 AppKit 锚点：它报的是窗口坐标，不经过 SwiftUI 的
         // 布局/滚动，行滚到哪它就在哪，不会被 List 的内边距带偏
-        .background { RowAnchor(anchorKey: anchorKey, box: hover) }
+        .background {
+            RowAnchor(anchorKey: anchorKey, box: hover)
+        }
         // 悬停的蓝底不画在行里，改成整页共用一块会滑动的（见 HoverBarView）：
         // 行里只留展开说明的淡底。
         .background {
@@ -1877,6 +2437,18 @@ struct RowView: View {
         .contentShape(Rectangle())
         // 文字转白跟着高亮条同一条弹簧走，整行是一起「漫」过去的
         .animation(.spring(response: 0.30, dampingFraction: 0.84), value: hover.on)
+
+        // 行收起来之后，「展开全部」也回到折叠态：下次点开这一行还是先看 8 行摘要，
+        // 不会是上次留着的整段长文。顺带把量到的高度清掉，换个 App 复用这一行时重新量。
+        .onChange(of: expanded) { _, now in
+            if !now { notes.forget(row.app.id) }
+        }
+        // List 会复用行视图：换了一个 App 就必须清掉上一个 App 的测量值，
+        // 否则一颗只有三行说明的行会继承上一行的一千字高度，白给一个「展开全部」
+        .onChange(of: row.app.id) { _, _ in
+            notes.forget(row.app.id)
+            measure.reset()
+        }
 
         // 分隔线：跟 App Store 的「最近更新」一致，从图标左边缘起、到内容右边缘止，
         // 也就是和整行的内容区同宽，不是对齐到文字。
@@ -1909,38 +2481,95 @@ struct RowView: View {
         return lines.isEmpty ? [notes] : lines
     }
 
+    /// 折叠时露出多少说明：8 行。footnote 在 macOS 上一行约 16pt（字 12 + 行距），
+    /// 断行是按 • 分的段，段内还会自己折行，所以这里量的是「像素高度」不是「条数」。
+    private var notesPreviewHeight: CGFloat { 8 * 16 }
+
+    private var notesExpanded: Bool { notes.isExpanded(row.app.id) }
+
+    /// 自然高度超过预览高度才算「长说明」，要给它「展开全部」。
+    /// 高度记在本行自己的 RowMeasure 上：量到后只重绘这一行，
+    /// 不放全局字典、不发布给所有行，近百行滚动时才不会卡那 0.5s。
+    private var notesIsLong: Bool { measure.natural > notesPreviewHeight + 2 }
+
+    /// 说明本体：抽出来是为了能在它身上挂「先量高、再裁剪」的修饰符
+    @ViewBuilder
+    private var noteText: some View {
+        if noteLines.isEmpty {
+            Text("这个 App 的更新源没带更新说明")
+                .font(.footnote)
+                .foregroundStyle(hover.on ? AnyShapeStyle(Color.white.opacity(0.7)) : AnyShapeStyle(.tertiary))
+        } else {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(Array(noteLines.enumerated()), id: \.offset) { _, line in
+                    Text(line)
+                        .font(.footnote)
+                        .foregroundStyle(hover.on ? Color.white.opacity(0.85) : Color.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
     @ViewBuilder
     private var notesBlock: some View {
         VStack(alignment: .leading, spacing: 6) {
-            if noteLines.isEmpty {
-                Text("这个 App 的更新源没带更新说明")
-                    .font(.footnote)
-                    .foregroundStyle(hover.on ? AnyShapeStyle(Color.white.opacity(0.7)) : AnyShapeStyle(.tertiary))
-            } else {
-                VStack(alignment: .leading, spacing: 3) {
-                    ForEach(Array(noteLines.enumerated()), id: \.offset) { _, line in
-                        Text(line)
-                            .font(.footnote)
-                            .foregroundStyle(hover.on ? Color.white.opacity(0.85) : Color.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
+            noteText
+                // 先量自然高度（量在裁剪之前）：只有没被压扁的时候才知道它到底多长。
+                // 量到后只通知本行重绘一次，「展开全部」按钮据此决定要不要出现
+                .background {
+                    GeometryReader { g in
+                        Color.clear
+                            .onChange(of: g.size.height, initial: true) { _, h in
+                                measure.set(h)
+                            }
                     }
                 }
-                .textSelection(.enabled)
+                // 折叠态压到 8 行高。Permute 那种源给的是一千多字一整段、
+                // 既没有 • 也没有换行，不压一下展开就把整个列表顶出屏幕。
+                .frame(maxHeight: notesExpanded ? nil : notesPreviewHeight, alignment: .top)
+                .clipped()
+                // 折叠时底部淡出，别让最后一行被一刀切成半截字
+                .mask(alignment: .top) {
+                    if notesIsLong && !notesExpanded {
+                        LinearGradient(
+                            stops: [.init(color: .black, location: 0),
+                                    .init(color: .black, location: 1 - 20 / notesPreviewHeight),
+                                    .init(color: .clear, location: 1)],
+                            startPoint: .top, endPoint: .bottom)
+                    } else {
+                        Rectangle().fill(Color.black)
+                    }
+                }
+
+            if notesIsLong {
+                textButton(notesExpanded ? "收起" : "展开全部") {
+                    notes.toggle(row.app.id)
+                }
             }
 
-            // 左键不再跳官网，去处就摆在这里（右键菜单里也还在）
-            HStack(spacing: 12) {
-                if row.result?.downloadURL != nil {
-                    textButton("打开下载页") { service.openUpdate(for: row) }
+            // 去处放最下面：先读这次更新了什么，再决定要不要点进去。
+            // 「在 Finder 中显示」去掉了：右键菜单里本来就有，不用占一行位置。
+            // 两个链接都没有的（检测失败这类）整行不画，否则会留一条空的间距。
+            // 往右缩进 8pt：这一行在行底，左边正是高亮条 12pt 圆角的位置，
+            // 贴着左边缘的话「打」字会被圆弧切掉一角。
+            if row.result?.downloadURL != nil || row.result?.homepage != nil {
+                HStack(spacing: 12) {
+                    if row.result?.downloadURL != nil {
+                        textButton("打开下载页") { service.openUpdate(for: row) }
+                    }
+                    if row.result?.homepage != nil {
+                        textButton("官网") { service.openSite(for: row) }
+                    }
+                    Spacer(minLength: 0)
                 }
-                if row.result?.homepage != nil {
-                    textButton("官网") { service.openSite(for: row) }
-                }
-                textButton("在 Finder 中显示") { service.reveal(row.app) }
-                Spacer(minLength: 0)
+                .padding(.leading, 8)
             }
         }
         .padding(.top, 2)
+        // 底部留白：高亮条是照着整行画的，内容贴到边上线上的圆角就会切到字。
+        // 5pt 刚好让最后一行字（链接行）离高亮条底边的圆弧有一段距离。
+        .padding(.bottom, 5)
     }
 
     private func textButton(_ title: String, action: @escaping () -> Void) -> some View {
@@ -1975,17 +2604,17 @@ struct RowView: View {
         case .updateAvailable:
             // 照系统菜单的做法：右侧那一列（快捷键 / 取值）在未高亮时是「次要色」，
             // 高亮后才提到纯白。次要色跟着明暗模式走，浅色面板下是黑、深色下是白。
-            Button {
-                service.openUpdate(for: row)
-            } label: {
-                Text("更新")
-                    .font(.subheadline)
-                    .foregroundStyle(hover.on ? Color.white : Color.secondary)
-                    .padding(.vertical, 4.5)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .help("打开「\(row.app.name)」的下载页")
+            // 用点击手势而不是 Button：Button 在 List 行里要建整套控件、焦点链、
+            // 悬停跟踪，近百行滚动时每新露出一行都要付一遍，这是滚动尖峰的大头。
+            // 这是个真操作（打开下载页），无障碍用 isButton + action 补回来。
+            Text("更新")
+                .font(.subheadline)
+                .foregroundStyle(hover.on ? Color.white : Color.secondary)
+                .padding(.vertical, 4.5)
+                .contentShape(Rectangle())
+                .onTapGesture { service.openUpdate(for: row) }
+                .accessibilityAddTraits(.isButton)
+                .accessibilityAction { service.openUpdate(for: row) }
         case .upToDate:
             // 行尾照旧写「已是最新版本」；页签里的分组标题不再重复这句话
             statusText("已是最新版本")
@@ -1999,7 +2628,6 @@ struct RowView: View {
                 statusText("检测失败")
             }
             // 为什么失败：副标题只放得下一句短的，完整原文（限流、超时…）放悬停提示
-            .help(row.result?.note ?? "检测失败")
         case .unknown:
             Text("无检测源")
                 .font(.caption2)
@@ -2100,7 +2728,6 @@ private struct AboutLinkRow: View {
             }
         }
         .buttonStyle(.plain)
-        .help(title)
     }
 }
 

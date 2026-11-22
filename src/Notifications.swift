@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Foundation
 import UserNotifications
@@ -47,6 +48,16 @@ final class Notifier: NSObject, ObservableObject, UNUserNotificationCenterDelega
                     || settings.authorizationStatus == .provisional
             }
         }
+    }
+
+    /// 打开系统设置的「通知 → Sentry」这一页。
+    /// 必须带 `?id=<bundle id>`：不带的话只落在通知面板的总列表上，
+    /// 用户还得自己在几十个 App 里翻出 Sentry —— 那一步最容易放弃。
+    func openSystemSettings() {
+        let bundleId = Bundle.main.bundleIdentifier ?? "com.hushixiong.sentry"
+        let string = "x-apple.systempreferences:com.apple.Notifications-Settings.extension?id=\(bundleId)"
+        guard let url = URL(string: string) else { return }
+        NSWorkspace.shared.open(url)
     }
 
     func post(title: String, body: String, id: String, userInfo: [AnyHashable: Any] = [:]) {

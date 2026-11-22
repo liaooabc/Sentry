@@ -31,6 +31,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cancellable: AnyCancellable?
     private var bobCancellable: AnyCancellable?
     private var settingsCancellable: AnyCancellable?
+    /// 外观（跟随系统 / 浅色 / 深色）：设置里改一次，整个应用跟着换
+    private var appearanceCancellable: AnyCancellable?
     private var selfCheckScheduler: NSBackgroundActivityScheduler?
     /// 面板开着时的键盘监听（↑↓ / Return）；只有面板是 key window 才接管
     private var keyMonitor: Any?
@@ -48,7 +50,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let rippleEndRatio: CGFloat = 0.956    // 扩到框边
     private static let ripplePeriod: CFTimeInterval = 1.6
 
-    private let panelSize = NSSize(width: 364, height: 548)
+    private let panelSize = NSSize(width: PanelMetrics.width, height: PanelMetrics.height)
     /// NSPopover 的 contentSize 就是整块玻璃的大小，内容直接铺满；
     /// 自建面板也照这个来，窗口 = 内容 364×548，不能额外留内边距，
     /// 否则面板会整体变大、控件相对边缘的位置全被推到里面去。
@@ -71,6 +73,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         buildMainMenu()
         buildPanel()
+
+        // 调试用：SENTRY_SHOW_PANEL=1 时启动就把面板摆出来，方便截图核对排版；
+        // =2 直接摆成顶栏搜索态，=3 摆面板并翻到设置页。正常启动没有这个开关，行为完全不变。
+        // （写成一个变量带多个值，是因为 open 只认一个 --env，给两个变量第二个会整个丢掉。）
+        if let demo = debugValue("SENTRY_SHOW_PANEL"), demo != "0" {
+            // 配合 SENTRY_PANEL_TAB=1 可以直接摆到「其他」页，方便截图核对
+            if let tab = debugValue("SENTRY_PANEL_TAB"), let n = Int(tab) {
+                ui.tab = n
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                self?.showPanel()
+                if demo == "2" { self?.ui.searchActive = true }
+                // 再等一拍：面板刚弹出来时 SwiftUI 还在建视图，这时翻页会被吃掉
+                if demo == "3" {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { self?.showSettings() }
+                }
+            }
+        }
+
+        // 调试用：SENTRY_SCAN_NOW=1 时启动就强制全量重扫。
+        // 正常启动只在结果过期（设置里的间隔小时数）时才查，验证新检测源时等不起。
+        if debugValue("SENTRY_SCAN_NOW") == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+                self?.service.checkAll(force: true)
+            }
+        }
+
+        // 调试用：UR_SCROLL_TEST=1 时面板弹出来后自己把列表滚一遍，量滚动掉帧。
+        // 用外部合成滚轮事件驱动面板很容易被真实点击打断，让 App 自己滚自己的
+        // 列表最稳：同一套 SwiftUI 布局、同一套 List，量到的就是用户滚时的开销。
+        if debugValue("UR_SCROLL_TEST") == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                self?.runScrollTest()
+            }
+        }
+
+        // 调试用：SENTRY_TEST_NOTIFY=1 时启动 3 秒后发一条测试通知，
+        // 排查「开关开着但收不到」到底是授权、投递还是展示的问题。
+        if debugValue("SENTRY_TEST_NOTIFY") == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                Notifier.shared.post(title: "Sentry 测试通知",
+                                     body: "能看到这条，说明通知链路是通的。",
+                                     id: "sentry.test.\(Int(Date().timeIntervalSince1970))")
+            }
+        }
 
         // 首次安装先看引导：通知授权放在引导里，不让系统授权框抢在欢迎窗口前面弹出来
         if OnboardingWindow.isNeeded {
@@ -116,6 +163,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 Task { @MainActor in self?.updateBadge() }
             }
 
+        // 外观：跟随系统 / 浅色 / 深色。设置一变就落到 NSApp.appearance 上；
+        // 启动时 bootstrap 载入完 state.json 也会再发一次，所以不用额外写「启动时应用」。
+        appearanceCancellable = service.$settings
+            .map(\.appearanceMode)
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { mode in
+                Task { @MainActor in AppAppearance.apply(mode) }
+            }
+
         updateBadge()
         service.bootstrap()
 
@@ -135,6 +192,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             completion(.finished)
         }
         selfCheckScheduler = selfCheck
+    }
+
+    /// 从系统设置切回来时重读一次通知权限：用户很可能刚在那边点了「允许通知」，
+    /// 不刷的话设置页还停在「已在系统设置中关闭」，开关也还是「去允许」。
+    func applicationDidBecomeActive(_ notification: Notification) {
+        Notifier.shared.refreshAuthorization()
+    }
+
+    /// 调试开关的取值：先看环境变量，再看 UserDefaults。
+    /// `open --env` 在新系统上时不时失效（LaunchServices 把请求当成「激活已有实例」，变量整个丢掉），
+    /// 所以留一条 `defaults write com.hushixiong.sentry SENTRY_SHOW_PANEL 3` 的路子。
+    private func debugValue(_ key: String) -> String? {
+        if let v = ProcessInfo.processInfo.environment[key], !v.isEmpty { return v }
+        return UserDefaults.standard.string(forKey: key)
     }
 
     // MARK: - 面板
@@ -269,6 +340,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// ⌘F：面板没开就先弹出来，再把焦点交给搜索框
     @objc private func focusSearch() {
         if panel?.isVisible != true { showPanel() }
+        // 顶栏平时是「排序 / 搜索」两颗按钮，输入框不在视图树里 —— 先把搜索态打开
+        ui.searchActive = true
         // 面板刚弹出时 SwiftUI 还没把搜索框建出来，等一拍再发
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
             NotificationCenter.default.post(name: .updateRadarFocusSearch, object: nil)
@@ -279,7 +352,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showPanel() {
         guard let panel, !panel.isVisible else { return }
-        statusItem.button?.toolTip = nil
         positionPanel()
         NSApp.activate(ignoringOtherApps: true)
         panel.alphaValue = 1
@@ -289,6 +361,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.makeKey()
         installPanelKeyMonitor()
         installOutsideClickMonitor()
+        // 排序方式是「最近使用」时补刷一下时间：这东西跟着用户开 App 一直在变，
+        // 只在扫描那一刻取一次的话，开一会儿顺序就不对了（内部有限流，60 秒最多一次）
+        service.refreshLastUsed()
     }
 
     /// 贴着菜单栏图标下沿 6pt、水平居中，左右夹在屏幕可见区域内
@@ -316,7 +391,115 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ui.showSettings = false
         ui.showAbout = false
         ui.aboutFromSettings = false
+        // 搜索态也复位：下次点开先看到「排序 / 搜索」两颗按钮，而不是停在输入框上。
+        // 不动的只有 query：列表还是上次筛过的（放大镜染色提示），点一下还能接着改。
+        ui.searchActive = false
         updateBadge()
+    }
+
+    // MARK: - 调试：自动滚动量帧
+
+    private var scrollTestTimer: Timer?
+
+    /// 依次把面板里每个 List 用 60Hz 合成滚轮滚 1.8 秒，量滚动掉帧。
+    /// 用 NSScrollView.scrollWheel 走真实滚动通路（clipView.scroll(to:) 对
+    /// ListCore 的虚拟化文档高度无效，只会滚几十像素）。
+    ///
+    /// 帧耗时口径跟人工测的一致：60Hz Timer 相邻两次 tick 的实际间隔就是主线程的
+    /// 一帧（Timer 被主线程的活拖慢多少，间隔就多长）。每 0.5s 汇总一次
+    /// 「窗口内最长单帧 + >20ms 的掉帧次数」，整轮结束再报一次全局最长单帧。
+    private func runScrollTest() {
+        guard let panel, panel.isVisible else { writeScrollTest("panel-not-visible"); return }
+        // 每轮重测都从头记
+        try? FileManager.default.removeItem(atPath: "/tmp/scrolltest.log")
+        var views: [NSScrollView] = []
+        func walk(_ v: NSView) {
+            if let sv = v as? NSScrollView { views.append(sv) }
+            for sub in v.subviews { walk(sub) }
+        }
+        if let cv = panel.contentView { walk(cv) }
+        guard !views.isEmpty else { writeScrollTest("no-scrollview"); return }
+
+        var index = 0
+        var elapsed: TimeInterval = 0
+        var markPending = true
+        writeScrollTest("lists=" + views.map { String(Int($0.documentView?.bounds.height ?? -1)) }.joined(separator: ","))
+
+        // 帧耗时统计
+        var lastTick = CACurrentMediaTime()
+        var winStart = lastTick
+        var winMax = 0.0
+        var winDrops = 0
+        var winFrames = 0
+        var globalMax = 0.0
+        var globalDrops = 0
+
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] timer in
+            MainActor.assumeIsolated {
+                guard let self else { timer.invalidate(); return }
+
+                // 先量上一帧到现在过了多久（这就是主线程这一帧的耗时）
+                let now = CACurrentMediaTime()
+                let gap = now - lastTick
+                lastTick = now
+                winMax = max(winMax, gap)
+                winFrames += 1
+                globalMax = max(globalMax, gap)
+                if gap > 0.020 { winDrops += 1; globalDrops += 1 }
+                if now - winStart >= 0.5 {
+                    self.writeScrollTest(String(format: "win list%d frames=%d max=%.0fms drops=%d",
+                                                min(index, views.count - 1), winFrames, winMax * 1000, winDrops))
+                    winStart = now; winMax = 0; winDrops = 0; winFrames = 0
+                }
+
+                if index >= views.count {
+                    timer.invalidate()
+                    self.scrollTestTimer = nil
+                    self.writeScrollTest(String(format: "end globalMax=%.0fms globalDrops=%d", globalMax * 1000, globalDrops))
+                    // 量完自己收起面板并退出，不留在屏幕上打扰人
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                        self?.hidePanel()
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                        NSApp.terminate(nil)
+                    }
+                    return
+                }
+                let sv = views[index]
+                if markPending {
+                    markPending = false
+                    self.writeScrollTest("list\(index) start doc=\(Int(sv.documentView?.bounds.height ?? -1)) y=\(Int(sv.contentView.bounds.origin.y))")
+                }
+                if let cg = CGEvent(scrollWheelEvent2Source: nil, units: .pixel,
+                                    wheelCount: 1, wheel1: -24, wheel2: 0, wheel3: 0),
+                   let ev = NSEvent(cgEvent: cg) {
+                    sv.scrollWheel(with: ev)
+                }
+                elapsed += 1.0 / 60.0
+                if elapsed >= 1.8 {
+                    self.writeScrollTest("list\(index) end doc=\(Int(sv.documentView?.bounds.height ?? -1)) y=\(Int(sv.contentView.bounds.origin.y))")
+                    index += 1
+                    elapsed = 0
+                    markPending = true
+                }
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        scrollTestTimer = timer
+    }
+
+    private func writeScrollTest(_ s: String) {
+        // 追加写：一轮测试要留多行（每 0.5s 一行 + 首尾），覆盖写就只剩最后一行
+        let line = "scrolltest \(s)\n"
+        let path = "/tmp/scrolltest.log"
+        guard let data = line.data(using: .utf8) else { return }
+        if let fh = FileHandle(forWritingAtPath: path) {
+            fh.seekToEndOfFile()
+            fh.write(data)
+            try? fh.close()
+        } else {
+            try? data.write(to: URL(fileURLWithPath: path))
+        }
     }
 
     // MARK: - 面板键盘
@@ -373,7 +556,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case 126: moveKeyRow(-1); return true      // ↑
         case 125: moveKeyRow(1); return true       // ↓
         case 36, 76: activateKeyRow(); return true // Return / 小键盘 Enter
-        case 53: hidePanel(); return true          // Esc
+        case 53:
+            // Esc：搜索框已经收起、但列表还被筛选词筛着 —— 先把筛选清掉（列出全部），
+            // 再按一次才收面板。不然收起之后就没有「一键看全部」的地方了。
+            if !ui.searchActive, !ui.query.isEmpty {
+                ui.applySearch("")
+                return true
+            }
+            hidePanel()
+            return true
         default: return false
         }
     }
@@ -405,7 +596,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !rippling { button.image = makeStatusIcon() }
         button.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
         button.title = (n > 0 && service.settings.countVisible) ? " \(n)" : ""
-        button.toolTip = n > 0 ? "\(n) 个 App 有新版本" : "Sentry · 全部都是最新的"
+        // 菜单栏那颗图标不挂 tooltip：小夭说系统这个黄色气泡「有点烦人」，
+        // 有没有新版本看角标数字就够了（2026-11-21）。
     }
 
     // MARK: - 扫描时"雷达波"

@@ -1,8 +1,9 @@
 import Foundation
 
-/// 1.5.0 / v4.13.3 / 2026.39 / "Version 4.13.3" 这种才算版本号，"Download" 这类标题不算
+/// 1.5.0 / v4.13.3 / 2026.39 / "Version 4.13.3" 这种才算版本号，"Download" 这类标题不算。
+/// 尾巴带括号构建号的也算（1.58.0 (91297)）：先拆掉括号再判，不然「有空格」这一条就把它挡了。
 private func looksLikeVersion(_ s: String) -> Bool {
-    var t = s.trimmingCharacters(in: .whitespaces)
+    var t = splitTrailingBuild(s).version.trimmingCharacters(in: .whitespaces)
     for prefix in ["Version ", "version ", "v"] where t.hasPrefix(prefix) {
         t = String(t.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
         break
@@ -44,10 +45,9 @@ final class AppcastParser: NSObject, XMLParserDelegate {
         /// <sparkle:channel>beta</sparkle:channel>：只有订阅了该通道的客户端才该收这条
         var channel: String?
 
-        /// 对外展示、用来比较的版本号。营销版本号优先，其次 title（老式 appcast 把版本写在 title 里），
-        /// 最后才是构建号——构建号跟 CFBundleShortVersionString 不是一套编号，不能混比。
-        var marketingVersion: String? {
-            if let v = shortVersion, !v.isEmpty { return v }
+        /// 源里写的那串原始版本号（还没拆掉括号里的构建号）
+        private var rawMarketingVersion: String? {
+            if let v = shortVersion?.trimmingCharacters(in: .whitespaces), !v.isEmpty { return v }
             if let t = title, looksLikeVersion(t) {
                 // 去掉 "Version " 前缀再拿去比较
                 var s = t.trimmingCharacters(in: .whitespaces)
@@ -58,6 +58,20 @@ final class AppcastParser: NSObject, XMLParserDelegate {
                 return s
             }
             return nil
+        }
+
+        /// 对外展示、用来比较的版本号。营销版本号优先，其次 title（老式 appcast 把版本写在 title 里），
+        /// 最后才是构建号——构建号跟 CFBundleShortVersionString 不是一套编号，不能混比。
+        ///
+        /// 尾巴上的括号构建号要拆掉：Dia 的 `shortVersionString` 是 `1.58.0 (91297)`，
+        /// 整串拿去比就会把「装到最新」判成「有新版」。
+        var marketingVersion: String? {
+            rawMarketingVersion.map { splitTrailingBuild($0).version }
+        }
+
+        /// 括号里那个构建号（Dia 的 91297），能跟本机 `CFBundleVersion` 直接对上
+        var marketingBuild: String? {
+            rawMarketingVersion.flatMap { splitTrailingBuild($0).build }
         }
     }
 
@@ -86,7 +100,15 @@ final class AppcastParser: NSObject, XMLParserDelegate {
             // Sparkle 1.5+ 常把版本写在 enclosure 属性上，而不是子元素里。
             // 属性名大小写、带不带 sparkle: 前缀都不统一，按「后缀匹配」取。
             if let url = Self.attr(attributeDict, names: ["url"]) {
-                current?.enclosure = url
+                // <deltas> 里的增量包也挂在 enclosure 上，而且排在完整包后面。
+                // 以前直接覆盖，Dia 就变成了「更新」点下去下一个 .delta（差分补丁，单独用装不上）。
+                // 判据：带 sparkle:deltaFrom 的就是增量包，只当完整包缺失时的兜底。
+                let isDelta = Self.attr(attributeDict,
+                                        names: ["sparkle:deltasfrom", "deltasfrom",
+                                                "sparkle:deltafrom", "deltafrom"]) != nil
+                if !isDelta || current?.enclosure == nil {
+                    current?.enclosure = url
+                }
             }
             if current?.shortVersion == nil,
                let s = Self.attr(attributeDict, names: ["sparkle:shortversionstring", "shortversionstring"]) {
@@ -196,6 +218,64 @@ func parseISO8601(_ s: String?) -> Date? {
 
 // MARK: - 网络
 
+/// Info.plist 里**没有** SUFeedURL、但确实用 Sparkle 的 App。
+/// 这类把 feed 写在代码里（PastePal 的 SparkleService 就是 `feedURLStringForUpdater:` 返回的），
+/// 包内翻不到地址，只能按 bundle id 钉一条官方 appcast。
+/// 表要小：地址失效就当这个 App「无检测源」，不要为此加一堆兜底。
+enum KnownAppcasts {
+    static func feed(for app: InstalledApp) -> String? {
+        feed(forBundleId: app.bundleId)
+    }
+
+    /// 传 bundle id 而不是整个 App：测试不用为了查一张表去拼 InstalledApp
+    static func feed(forBundleId bundleId: String?) -> String? {
+        switch bundleId {
+        case "com.onmyway133.PastePal":
+            // 作者自己发在 GitHub archives 仓库里的 appcast（标题 "PastePal Standalone"）。
+            // 官网 pastepal.app / onmyway133.github.io 的 appcast 路径都已失效。
+            return "https://raw.githubusercontent.com/onmyway133/archives/master/PastePal.xml"
+        default:
+            return nil
+        }
+    }
+}
+
+/// 商店里也有、但这台机器上装的是独立版的 App。
+///
+/// 这类 App 有两条互不相干的发行通道，版本号还常常不是一套，所以「用不用商店」要一个 App
+/// 一个 App 地定：
+/// - `.preferred`：商店版和独立版共用同一套版本号，商店就是最快最稳的那条路。
+/// - `.fallback`：商店版通常落后于独立版，只在 appcast / cask 全都不通时兜一层，
+///   总比显示「检测失败」强。
+///
+/// 表要小：只放查证过「商店记录确实存在、且是这个 App」的。
+/// 反例：Telegram 的 `com.tdesktop.Telegram`（Telegram Desktop）压根不在 App Store，
+/// cn / us / jp 三个区 lookup 都是 0 条；商店里的 Telegram 是另一款产品
+/// （`ru.keepcoder.Telegram` 原生版，13.x），拿它的版本号去比 7.4.4 只会误报更新。
+enum KnownAppStore {
+    enum Mode {
+        case preferred
+        case fallback
+    }
+
+    static func mode(forBundleId bundleId: String?) -> Mode? {
+        switch bundleId {
+        case "com.ideasoncanvas.mindnode":
+            // 商店记录是「一份通用 App」（features 带 iosUniversal），版本号就是 Mac 版的
+            // 2026.x，跟独立版完全一致。发布说明页要 6~8 秒、还常被并发扫描挤成超时，
+            // 商店这个请求几百毫秒就回。
+            return .preferred
+        case "com.onmyway133.PastePal":
+            // 商店 2.17.0 / 独立版 2.22.4：商店版落后，抢第一顺位就等于放弃真正的版本号。
+            // 但它的 appcast 挂在 raw.githubusercontent.com 上，国内时不时 TLS 失败，
+            // 那时候商店记录至少能说清「你装的是最新独立版」。
+            return .fallback
+        default:
+            return nil
+        }
+    }
+}
+
 /// 从更新源地址推「官网」：
 /// - GitHub 托管的（raw.githubusercontent.com / github.com/owner/repo/...）→ 仓库页
 /// - downloads./download./cdn. 开头的下载主机场 → 去掉那一段（downloads.skylum.com → skylum.com）
@@ -230,12 +310,16 @@ func siteFromFeed(_ urlString: String?) -> String? {
 }
 
 enum Net {
+    /// 单个请求的超时：8 秒会把「慢但活着」的源（CleanShot X 的 appcast 实测 10 秒）误判成失败
+    static let requestTimeout: TimeInterval = 15
+
     static let session: URLSession = {
         let c = URLSessionConfiguration.ephemeral
         // 死掉的源（停更的 appcast、国内连不上的接口）会一直占着并发槽位，
-        // 所以超时不能给太宽裕：10 秒还没回话就当它没有。
-        c.timeoutIntervalForRequest = 8
-        c.timeoutIntervalForResource = 12
+        // 所以超时不能给太宽裕；但 8 秒太紧了——CleanShot X 的 appcast 实测要 10 秒，
+        // 会被误报成「更新源超时」。15 秒是两边都还过得去的值。
+        c.timeoutIntervalForRequest = Net.requestTimeout
+        c.timeoutIntervalForResource = Net.requestTimeout * 1.6
         // 默认每主机只 6 条连接，iTunes 查询动辄 30 个包，会被自己卡住
         c.httpMaximumConnectionsPerHost = 12
         c.httpAdditionalHeaders = [
@@ -300,7 +384,7 @@ enum Net {
         let s = URLSession(configuration: session.configuration, delegate: probe, delegateQueue: nil)
         defer { s.finishTasksAndInvalidate() }
         var req = URLRequest(url: url)
-        req.timeoutInterval = 8
+        req.timeoutInterval = Net.requestTimeout
         _ = try? await s.data(for: req)      // 重定向被掐断会抛错，正常
         return probe.target
     }
@@ -314,16 +398,22 @@ enum Net {
         case status(Int)
         case empty
         case notAppcast
+        case notUpdateManifest
+        /// 清单拿到了、也能解析，但版本编号跟本机不是一套（抖音直播伴侣的框架版本号）。
+        /// 这不算故障，上层要安静地当「没有检测源」，别报「地址已失效」误导人。
+        case mismatchedVersion
         case noItems
         case incompatibleSystem
 
         var note: String {
             switch self {
-            case .timeout: return "更新源超时（8 秒没有响应）"
+            case .timeout: return "更新源超时（\(Int(Net.requestTimeout)) 秒没有响应）"
             case .transport: return "更新源连接失败（DNS 或 TLS 出错）"
             case .status(let code): return "更新源返回 HTTP \(code)"
             case .empty: return "更新源返回了空内容"
             case .notAppcast: return "更新源跳到的是网页，不是 appcast（源地址可能已失效）"
+            case .notUpdateManifest: return "更新源跳到的是网页，不是 electron 更新清单（地址可能已失效）"
+            case .mismatchedVersion: return "更新源里的版本号跟本机不是一套编号"
             case .noItems: return "更新源里没有可识别的版本条目"
             case .incompatibleSystem: return "更新源里的版本要求比本机系统更高，暂时装不了"
             }
@@ -350,6 +440,22 @@ enum Net {
     static func text(_ urlString: String) async -> String? {
         if case .success(let s) = await textResult(urlString) { return s }
         return nil
+    }
+
+    /// 少数官网页面本身就慢（MindNode 发布说明页带压缩也有 39KB，实测 7 秒以上），
+    /// 全局 15 秒在并发扫描时会把它挤成超时 —— 这种单独放宽，不牵动其它源。
+    static func text(_ urlString: String, timeout: TimeInterval) async -> String? {
+        guard let url = URL(string: urlString) else { return nil }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = timeout
+        do {
+            let (data, resp) = try await session.data(for: request)
+            guard let http = resp as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode) else { return nil }
+            return String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+        } catch {
+            return nil
+        }
     }
 
     /// 和 text 一样，但把失败原因带上去（只有 appcast 这条路要看原因）
@@ -395,7 +501,7 @@ enum Net {
         let s = URLSession(configuration: session.configuration, delegate: blocker, delegateQueue: nil)
         defer { s.finishTasksAndInvalidate() }
         var request = URLRequest(url: url)
-        request.timeoutInterval = 8
+        request.timeoutInterval = Net.requestTimeout
         _ = try? await s.data(for: request)   // 重定向被掐断会抛错，正常
         guard let final = blocker.target?.absoluteString else { return nil }
         guard let tag = final.components(separatedBy: "/releases/tag/").last,
@@ -468,6 +574,12 @@ enum Cask {
         let homepage: String?
     }
 
+    /// 只在设了 UR_DEBUG_CASK 时往 stderr 打一行，正常使用零开销
+    static func debugLog(_ line: String) {
+        guard ProcessInfo.processInfo.environment["UR_DEBUG_CASK"] != nil else { return }
+        FileHandle.standardError.write(("[cask] " + line + "\n").data(using: .utf8)!)
+    }
+
     private static let lock = NSLock()
     private static var store: [String: Cached]?
     private static var mapLoaded = false
@@ -491,9 +603,13 @@ enum Cask {
         mapLoaded = true
         guard let url = Bundle.main.url(forResource: "cask-map", withExtension: "json"),
               let data = try? Data(contentsOf: url),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            debugLog("loadMap 失败：找不到或读不了 cask-map.json（Bundle=\(Bundle.main.bundlePath)）")
+            return
+        }
         nameMap = obj["apps"] as? [String: String] ?? [:]
         bundleMap = obj["bundles"] as? [String: String] ?? [:]
+        debugLog("loadMap 完成：apps=\(nameMap.count) bundles=\(bundleMap.count)")
     }
 
     /// 一个 App 对应哪个 cask：先按 .app 文件名，再按 bundle id
@@ -577,8 +693,13 @@ enum Cask {
         return v
     }
 
-    private static func fetch(_ token: String) async -> Cached? {
-        if let hit = loadCache()[token], Date().timeIntervalSince(hit.fetchedAt) < 12 * 3600 {
+    /// 单个 cask 的缓存时长。Homebrew 一天会更新几十次，12 小时太钝——
+    /// 今天 Gemini / UU远程 就是因为缓存过期前拿到的是旧版本号，被当成「已是最新」。
+    /// 2 小时够省流量（每个 App 一次 1KB 请求），点「扫描」还会强制绕过缓存。
+    private static let cacheTTL: TimeInterval = 2 * 3600
+
+    private static func fetch(_ token: String, force: Bool = false) async -> Cached? {
+        if !force, let hit = loadCache()[token], Date().timeIntervalSince(hit.fetchedAt) < cacheTTL {
             return hit
         }
         guard let obj = await Net.json("https://formulae.brew.sh/api/cask/\(token).json") as? [String: Any],
@@ -592,12 +713,23 @@ enum Cask {
         return entry
     }
 
-    static func lookup(_ app: InstalledApp) async -> Entry? {
-        guard let hit = token(for: app), let c = await fetch(hit.token) else { return nil }
+    static func lookup(_ app: InstalledApp, force: Bool = false) async -> Entry? {
+        guard let hit = token(for: app) else {
+            debugLog("\(app.name)：没有 cask 映射")
+            return nil
+        }
+        guard let c = await fetch(hit.token, force: force) else {
+            debugLog("\(app.name)：拉取 cask \(hit.token) 失败")
+            return nil
+        }
         // 只按文件名对上的，再用 cask 登记的 bundle id 复核一次：
         // 本机装的是 Telegram Desktop（com.tdesktop.Telegram），cask 里是原生版（ru.keepcoder.Telegram），名字一样但不是同一个 App
         if !hit.exact, let ids = c.bundles, !ids.isEmpty, let bid = app.bundleId, !ids.contains(bid) {
-            return nil
+            // 同一厂商前缀（com.topazlabs.*）算过关：这种 cask 是装 pkg 的，
+            // uninstall 段里登记的是安装包 id（com.topazlabs.VStudioPackage），
+            // 不是 App 的 bundle id（com.topazlabs.Topaz-Video）。
+            let family = vendorPrefix(bid)
+            if !ids.contains(where: { vendorPrefix($0) == family }) { return nil }
         }
         return Entry(token: hit.token, version: c.version, homepage: c.homepage)
     }
@@ -609,6 +741,12 @@ enum Cask {
         let c = current.split(separator: ".").map(String.init)
         guard l.count > c.count, Array(l.prefix(c.count)) == c else { return false }
         return l.dropFirst(c.count).allSatisfy { $0.count >= 6 && $0.allSatisfy(\.isNumber) }
+    }
+
+    /// bundle id 的厂商前缀：com.topazlabs.Topaz-Video → com.topazlabs
+    /// （不是 private：回归测试要直接调。）
+    static func vendorPrefix(_ bundleId: String) -> String {
+        bundleId.split(separator: ".").prefix(2).joined(separator: ".")
     }
 
     static func verdict(_ app: InstalledApp, entry: Entry, allowBeta: Bool) -> Checker.Outcome {
@@ -656,9 +794,10 @@ enum Checker {
     /// （QQ 商店 7.0.2 / 官网 6.9.x；WPS 商店 12.1.29182 / 官网 12.1.x）：
     /// 拿官网或 appcast 的版本去跟商店包比，只会误报「有新版本」，点进去还得自己下载安装包。
     static func check(_ app: InstalledApp, previous: CheckResult? = nil,
-                      allowBeta: Bool = false) async -> CheckResult {
+                      allowBeta: Bool = false, forceCask: Bool = false) async -> CheckResult {
         guard app.isAppStore, let bid = app.bundleId else {
-            return await checkOtherSources(app, previous: previous, allowBeta: allowBeta)
+            return await checkOtherSources(app, previous: previous, allowBeta: allowBeta,
+                                           forceCask: forceCask)
         }
         let now = Date()
 
@@ -718,13 +857,28 @@ enum Checker {
 
     /// 商店之外的检测源：厂商规则 → Sparkle appcast → Homebrew Cask
     private static func checkOtherSources(_ app: InstalledApp, previous: CheckResult?,
-                                          allowBeta: Bool) async -> CheckResult {
+                                          allowBeta: Bool, forceCask: Bool) async -> CheckResult {
         let bid = app.id
         let now = Date()
 
         func failed(_ note: String) -> CheckResult {
             CheckResult(bundleId: bid, status: .failed, latest: nil,
                         downloadURL: nil, note: note, source: "failed", checkedAt: now)
+        }
+
+        /// 商店兜底：只有 `KnownAppStore` 里登记过、且标了 `.fallback` 的才问。
+        /// 放在每条链的末尾 —— 商店版一般落后于独立版，只是「别让结果变成无源/失败」的第五层。
+        func storeFallback() async -> CheckResult? {
+            guard KnownAppStore.mode(forBundleId: app.bundleId) == .fallback,
+                  let o = await appStoreFallback(app, allowBeta: allowBeta) else { return nil }
+            return result(app, o, source: "appstore", now: now)
+        }
+
+        // 0. 商店优先：商店版跟独立版共用同一套版本号的那几个（MindNode），
+        //    问商店比爬官网发布页快一个数量级，也不用担心那页被并发挤成超时。
+        if KnownAppStore.mode(forBundleId: app.bundleId) == .preferred,
+           let o = await appStoreFallback(app, allowBeta: allowBeta) {
+            return result(app, o, source: "appstore", now: now)
         }
 
         // 1. 厂商专用规则优先（微信这类没有 appcast 的常用软件）
@@ -737,11 +891,14 @@ enum Checker {
                                    marker: r.marker, suppressedBeta: r.suppressedBeta ? true : nil)
             }
             // 规则命中但这次没抓到：说明是网络/页面变动问题，不是“没有检测源”
+            if let r = await storeFallback() { return r }
             return failed("官网页面没抓到版本号")
         }
 
-        // 2. Sparkle appcast：34 个 App 走这条路
-        if let feed = app.sparkleFeed {
+        // 2. Sparkle appcast：近 40 个 App 走这条路
+        //    少数 App 的 feed 不是写在 Info.plist 里，而是写死在代码中（PastePal 的
+        //    SparkleService），包内查不到 SUFeedURL —— 这种由 KnownAppcasts 按 bundle id 补一条。
+        if let feed = app.sparkleFeed ?? KnownAppcasts.feed(for: app) {
             switch await sparkle(feed: feed, current: app.version, build: app.build,
                                  allowBeta: allowBeta) {
             case .success(let r):
@@ -752,18 +909,48 @@ enum Checker {
                                    checkedAt: now, releaseDate: r.releaseDate, notes: r.notes,
                                    suppressedBeta: r.suppressedBeta ? true : nil)
             case .failure(let why):
-                // appcast 这次没抓到：先用社区版本库兜一层，别急着报「检测失败」
-                if let entry = await Cask.lookup(app) {
+                // appcast 这次没抓到：先用社区版本库兜一层，再让商店兜一层，别急着报「检测失败」
+                if let entry = await Cask.lookup(app, force: forceCask) {
                     return result(app, Cask.verdict(app, entry: entry, allowBeta: allowBeta), source: "cask", now: now)
+                }
+                if let r = await storeFallback() { return r }
+                return failed(why.note)
+            }
+        }
+
+        // 3. electron-updater：Electron 包没有 appcast，更新源在包内 app-update.yml。
+        //    放在 cask 之前 —— 官方清单一定比社区维护的 cask 新。
+        if let feed = app.electronFeed {
+            switch await electron(app, feed: feed, allowBeta: allowBeta) {
+            case .success(let r):
+                return CheckResult(bundleId: bid, status: r.status, latest: r.latest,
+                                   downloadURL: r.url, homepage: r.homepage ?? siteFromFeed(feed.primary),
+                                   note: r.note, source: "electron",
+                                   checkedAt: now, releaseDate: r.releaseDate, notes: r.notes,
+                                   suppressedBeta: r.suppressedBeta ? true : nil)
+            case .failure(let why):
+                // 和 appcast 一样：源这次没抓到先让 cask 兜一层，别急着报失败
+                if let entry = await Cask.lookup(app, force: forceCask) {
+                    return result(app, Cask.verdict(app, entry: entry, allowBeta: allowBeta), source: "cask", now: now)
+                }
+                if let r = await storeFallback() { return r }
+                // 编号体系对不上（抖音直播伴侣）不是故障，安静地记作「没有检测源」，
+                // 否则用户会看到一条「地址可能已失效」，而实际上源是好的。
+                if case .mismatchedVersion = why {
+                    return CheckResult(bundleId: bid, status: .unknown, latest: nil,
+                                       downloadURL: nil, note: nil, source: "manual", checkedAt: now)
                 }
                 return failed(why.note)
             }
         }
 
-        // 3. Homebrew Cask：没有 appcast、不在商店、也没有厂商规则的，最后一层
-        if let entry = await Cask.lookup(app) {
+        // 4. Homebrew Cask：没有 appcast、不在商店、也没有厂商规则的，最后一层
+        if let entry = await Cask.lookup(app, force: forceCask) {
             return result(app, Cask.verdict(app, entry: entry, allowBeta: allowBeta), source: "cask", now: now)
         }
+
+        // 5. 商店兜底：一个源都没有的，最后问一次 App Store（只问登记过的几个）
+        if let r = await storeFallback() { return r }
 
         return CheckResult(bundleId: bid, status: .unknown, latest: nil,
                            downloadURL: nil, note: nil, source: "manual", checkedAt: now)
@@ -825,8 +1012,11 @@ enum Checker {
             if !compareBeta, isBeta { continue }
             guard systemSatisfies(it.minSystem) else { continue }
             let latest = v
-            // 有的 Sparkle 源把构建号写进 title，本机装的已经是这个包 → 已是最新
-            if latestIsInstalledBuild(latest, current: current, build: build) {
+            // 有的 Sparkle 源把构建号写进 title，本机装的已经是这个包 → 已是最新；
+            // 括号里带构建号的（Dia 的 1.58.0 (91297)）也一样：构建号跟本机
+            // CFBundleVersion 对上就是同一个包，版本号根本没变。
+            if latestIsInstalledBuild(latest, current: current, build: build)
+                || sameBuild(it.buildVersion ?? it.marketingBuild, build) {
                 return .success(Outcome(status: .upToDate, latest: latest,
                                         url: it.enclosure ?? it.link ?? feed,
                                         homepage: siteFromFeed(it.link) ?? siteFromFeed(feed),
@@ -860,8 +1050,87 @@ enum Checker {
         return .failure(sawAnyVersioned ? .incompatibleSystem : .noItems)
     }
 
-    static func appStore(bundleId: String, name: String, current: String, build: String?, installedAt: Date?,
-                         country: String, allowBeta: Bool) async -> Outcome? {
+    // MARK: - electron-updater
+
+    /// Electron 应用的官方更新通道。版本号就在 `latest-mac.yml` 的顶格 `version:` 里，
+    /// 比 cask 新得多也准得多（cask 靠社区 PR，滞后几天是常态）。
+    ///
+    /// 候选地址按序试：`latest-mac.yml` 优先，channel 专属名兜底。
+    /// （Notion 写着 `channel: arm64`，但它没有 arm64-mac.yml —— 先试那个会白等一次超时。）
+    static func electron(_ app: InstalledApp, feed: ElectronFeed,
+                         allowBeta: Bool) async -> Result<Outcome, Net.SourceError> {
+        // github 型（洛雪音乐、zyfun）：版本号在 Releases 里，不必下 yml
+        if let repo = feed.githubRepo {
+            let page = "https://github.com/\(repo)/releases"
+            guard let r = await Rules.githubRepo(app: app, repo: repo,
+                                                 downloadPage: page, allowBeta: allowBeta)
+            else { return .failure(.noItems) }
+            var o = r
+            if o.homepage == nil { o.homepage = page }
+            return .success(o)
+        }
+
+        var lastError: Net.SourceError = .empty
+        for candidate in feed.candidates {
+            switch await Net.textResult(candidate) {
+            case .failure(let err):
+                lastError = err
+            case .success(let body):
+                // 200 + HTML 是常见坑：地址失效后站点把 404 页面用 200 回出来（幕布就是）。
+                // 不先挡掉，正则能在网页里翻出乱七八糟的数字当版本号。
+                let head = body.drop { $0 == "\n" || $0 == "\r" || $0 == " " }
+                if head.first == "<" {
+                    lastError = .notUpdateManifest
+                    continue
+                }
+                guard let latest = ElectronUpdater.parse(latestMacYML: body) else {
+                    lastError = .notUpdateManifest
+                    continue
+                }
+                guard plausible(latest.version, vs: app.version) else {
+                    lastError = .mismatchedVersion
+                    continue
+                }
+                // 下载地址：yml 和安装包同目录，相对文件名直接拼
+                let dir = candidate.split(separator: "/").dropLast().joined(separator: "/")
+                let url = latest.fileName.map { "\(dir)/\($0)" } ?? candidate
+                return .success(Rules.verdict(app, latest: latest.version, url: url,
+                                              releaseDate: latest.releaseDate, allowBeta: allowBeta))
+            }
+        }
+        return .failure(lastError)
+    }
+
+    /// electron 清单里的版本号和本机是不是同一套编号。
+    ///
+    /// 最典型的坑是抖音直播伴侣：包内的 app-update.yml 指向抖音自己的通用更新服务
+    /// （tron-demo），那份 latest-mac.yml 里写的是框架版本 1.0.2，App 本身却是 10.0.5。
+    /// 直接采用就会天天挂着「官方源当前是 1.0.2，你装的版本更高（可能是内测版）」——
+    /// 纯噪音。判据只要求「主版本号不脱节」，正常的跨大版本升级（1.x → 2.x）仍放行。
+    static func plausible(_ latest: String, vs current: String) -> Bool {
+        func major(_ v: String) -> Int? { v.split(separator: ".").first.flatMap { Int($0) } }
+        guard let a = major(latest), let b = major(current) else { return true }
+        return abs(a - b) <= 1
+    }
+
+    /// iTunes lookup 的一条记录，只留判断版本要用的几样东西。
+    /// 抽出来是因为两条路都要用它：商店装的 App（`appStore`），
+    /// 以及「商店里也卖、但这台机器装的是独立版」的 App（`appStoreFallback`）。
+    struct StoreRecord {
+        var version: String
+        var page: String?
+        var seller: String?
+        var release: Date?
+        var notes: String?
+        /// 这条记录能不能代表 Mac 版的版本号。
+        /// kind=mac-software 当然是；kind=software 但 features 带 iosUniversal 的
+        /// 「一份通用 App」（MindNode、APTV、Notability）也算——iOS / iPad / Mac
+        /// 共用同一个版本号。其余 kind=software 的是 iOS 主记录，版本号跟 Mac 包不是一套。
+        var isMacRecord: Bool
+    }
+
+    /// 查一条商店记录。查不到（下架、bundle id 对不上、网络故障）返回 nil。
+    static func storeRecord(bundleId: String, country: String) async -> StoreRecord? {
         // 加时间戳：Apple CDN 会把 iTunes lookup 结果缓存 24h，
         // 我们虽然已经关了 URLSession 缓存，但 Akamai 中间层可能还是按 URL 缓存，
         // 加个 &_=timestamp 让每次请求的 URL 都不一样，彻底绕开。
@@ -870,23 +1139,32 @@ enum Checker {
               let count = obj["resultCount"] as? Int, count > 0,
               let results = obj["results"] as? [[String: Any]],
               let first = results.first,
-              let firstVersion = first["version"] as? String else { return nil }
-        var latest = firstVersion
-        var page = first["trackViewUrl"] as? String
-        // sellerUrl 是开发者自己的官网（Compressor → apple.com/mac/compressor …），
-        // 比商店产品页更像「软件网站」
-        let seller = (first["sellerUrl"] as? String).flatMap { URL(string: $0)?.absoluteString }
-        var release = parseISO8601(first["currentVersionReleaseDate"] as? String)
+              let version = first["version"] as? String, !version.isEmpty else { return nil }
+        let features = (first["features"] as? [String]) ?? []
+        let isMac = (first["kind"] as? String) == "mac-software" || features.contains("iosUniversal")
+        return StoreRecord(
+            version: version,
+            page: first["trackViewUrl"] as? String,
+            // sellerUrl 是开发者自己的官网（Compressor → apple.com/mac/compressor …），
+            // 比商店产品页更像「软件网站」
+            seller: (first["sellerUrl"] as? String).flatMap { URL(string: $0)?.absoluteString },
+            release: parseISO8601(first["currentVersionReleaseDate"] as? String),
+            notes: plainNotes(first["releaseNotes"] as? String),
+            isMacRecord: isMac)
+    }
 
-        // kind=software 说明这条记录是 iOS 主记录（APTV 这种全平台通用 App）：
+    static func appStore(bundleId: String, name: String, current: String, build: String?, installedAt: Date?,
+                         country: String, allowBeta: Bool) async -> Outcome? {
+        guard let rec = await storeRecord(bundleId: bundleId, country: country) else { return nil }
+        var latest = rec.version
+        var page = rec.page
+        let seller = rec.seller
+        var release = rec.release
+
+        // 非 Mac 记录（kind=software 又不带 iosUniversal）说明这是 iOS 主记录：
         // version/更新说明都是 iPhone 版的，接口根本不提供 Mac 版的版本号
         //（Mac App Store 应用里显示的才是 Mac 版，二者经常差一个小版本）。
-        // 例外：features 带 iosUniversal 的是「一份通用 App」—— iOS / iPad / Mac
-        // 共用同一个版本号（APTV、Notability、Keynote 都是），这时记录的版本号
-        // 就是 Mac 版的版本号，可以照常比。
-        let features = (first["features"] as? [String]) ?? []
-        let isUniversalApp = features.contains("iosUniversal")
-        var isIOSPrimaryRecord = (first["kind"] as? String) != "mac-software" && !isUniversalApp
+        var isIOSPrimaryRecord = !rec.isMacRecord
 
         // Apple 自家 App（Pages / Numbers / Keynote、Final Cut、Logic 这些 Creator Studio）
         // 的 bundleId 跟 iOS 版是同一个，lookup 只会给 iOS 主记录 —— Final Cut 甚至返回 3.x。
@@ -938,11 +1216,57 @@ enum Checker {
                            ? "商店接口给的是 \(latest)，本机包标注 \(current)：这类通用 App 商店返回的是 iOS 版本号，跟 Mac 包没法比，先按已是最新算"
                            : nil,
                        releaseDate: release,
-                       notes: plainNotes(first["releaseNotes"] as? String))
+                       notes: rec.notes)
     }
 
-    /// Apple 自家 App 的 Mac 版记录。
-    /// Pages / Numbers / Keynote / Final Cut / Logic 这些「Creator Studio」App 的 bundleId
+    /// 「商店兜底」：不是从商店装的（包内没有收据），但商店里也有同一个 App。
+    ///
+    /// 为什么只能当兜底、不能抢第一顺位：商店版和独立版的发版节奏不一样，商店版经常落后
+    /// （PastePal 商店 2.17.0 / 独立版 2.22.4）。appcast / cask / 官网全都问不出结果时，
+    /// 拿商店记录顶上 —— 那也比显示「检测失败」或「无检测源」有用。
+    /// 唯一例外是 `KnownAppStore` 里标了 `.preferred` 的（MindNode）：商店版和独立版
+    /// 共用同一套 2026.x 编号，商店就是它最快最稳的那条路。
+    static func appStoreFallback(_ app: InstalledApp, allowBeta: Bool) async -> Outcome? {
+        guard let bid = app.bundleId, !app.isAppStore else { return nil }
+        async let cn = storeRecord(bundleId: bid, country: "cn")
+        async let us = storeRecord(bundleId: bid, country: "us")
+        // cn / us 各查一次取版本高的那条，原因同 appStore：两个区的 CDN 刷新时间不一致
+        let records = [await cn, await us].compactMap { $0 }.filter(\.isMacRecord)
+        guard let best = records.max(by: { Ver.compare($0.version, $1.version) == .orderedAscending })
+        else { return nil }
+        // 同一个 bundle id 也可能被作者换过产品线，商店里那条是另一个编号体系。
+        // 主版本号脱节就不认 —— 宁可不给源，也别拿一个看着像更新的数字吓人。
+        guard plausible(best.version, vs: app.version) else { return nil }
+        return storeFallbackOutcome(best, current: app.version, build: app.build, allowBeta: allowBeta)
+    }
+
+    /// 商店记录 → 检测结果。拆成纯函数，测试可以直接喂一条记录，不用联网。
+    static func storeFallbackOutcome(_ best: StoreRecord, current: String, build: String?,
+                                     allowBeta: Bool) -> Outcome {
+        let latest = best.version
+        if latestIsInstalledBuild(latest, current: current, build: build) {
+            return Outcome(status: .upToDate, latest: latest, url: best.page, homepage: best.seller,
+                           releaseDate: best.release, notes: best.notes)
+        }
+        if !(allowBeta || isPrereleaseVersion(current)), isPrereleaseVersion(latest) {
+            return Outcome(status: .upToDate, latest: current, url: best.page, homepage: best.seller,
+                           note: "只跟正式版比：商店里最新的是测试版（\(latest)）",
+                           releaseDate: best.release, suppressedBeta: true)
+        }
+        if Ver.isNewer(latest, than: current) {
+            return Outcome(status: .updateAvailable, latest: latest, url: best.page, homepage: best.seller,
+                           note: "版本号来自 App Store（这个包不是商店装的，商店版和独立版可能不同步）",
+                           releaseDate: best.release, notes: best.notes)
+        }
+        // 多数情况是这个：本机独立版比商店版还新，那商店就是「没有更新」，别报更新
+        return Outcome(status: .upToDate, latest: latest, url: best.page, homepage: best.seller,
+                       note: Ver.isNewer(current, than: latest)
+                           ? "App Store 上的是 \(latest)，本机独立版 \(current) 更新（商店版发版通常慢一些）"
+                           : nil,
+                       releaseDate: best.release, notes: best.notes)
+    }
+
+    /// Apple 自家 App 的 Mac 版记录。    /// Pages / Numbers / Keynote / Final Cut / Logic 这些「Creator Studio」App 的 bundleId
     /// 跟 iOS 版共用，`lookup?bundleId=` 只会返回 iOS 主记录（Final Cut 甚至只有 3.x）。
     /// Mac 版在商店里是独立记录，`search?entity=macSoftware` 按名字能搜到；
     /// 这里挑「名字对得上、卖家是 Apple、版本号最高」的那条。
@@ -1034,10 +1358,25 @@ enum Rules {
         return verdict(app, latest: version, url: downloadPage, allowBeta: allowBeta)
     }
 
+    /// MindNode 发布说明页里的版本号：取时间轴里最大的那个。
+    /// 页面结构（2026-11 实测）：
+    ///   <li id="2026.7.2" class="releasesTimeline__release ">
+    ///     <h2 class="releasesTimeline__version"><time dateTime="2026-11-10">2026.7.2</time>
+    /// 它没有 appcast（SUFeedURL 空、官网 appcast.xml 是 404 的网页），这页是唯一稳定来源。
+    /// 拆成纯函数是为了测试能直接喂一段 HTML，不用联网。
+    static func mindNodeVersion(in html: String) -> String? {
+        guard let re = try? NSRegularExpression(
+            pattern: #"releasesTimeline__version"><time[^>]*>([0-9][0-9.]*)</time>"#) else { return nil }
+        let ns = html as NSString
+        let found = re.matches(in: html, range: NSRange(location: 0, length: ns.length))
+        let versions = found.filter { $0.numberOfRanges > 1 }
+            .map { ns.substring(with: $0.range(at: 1)) }
+        return versions.max { Ver.compare($0, $1) == .orderedAscending }
+    }
+
     /// GitHub Releases 最新 tag
     static func githubRepo(app: InstalledApp, repo: String, downloadPage: String,
-                           allowBeta: Bool) async -> Checker.Outcome? {
-        switch await Net.githubLatestRelease(repo) {
+                           allowBeta: Bool) async -> Checker.Outcome? {        switch await Net.githubLatestRelease(repo) {
         case .failure(let err):
             if err.isRateLimited {
                 // 403/429 不是「这个 App 坏了」，是配额用完了：如实说，别让用户以为软件出问题
@@ -1187,6 +1526,22 @@ enum Rules {
             await githubRepo(app: app, repo: "Anjok07/ultimatevocalremovergui",
                              downloadPage: "https://github.com/Anjok07/ultimatevocalremovergui/releases",
                              allowBeta: allowBeta)
+        },
+        // MindNode：第一顺位是商店（见 KnownAppStore 的 `.preferred` —— 商店里是「通用 App」，
+        // 版本号就是这个 2026.x，几百毫秒就回）。这条规则是商店那条路走不通时的兜底：
+        // 包内 SUFeedURL 是空的（Sparkle 的 feed 写在代码里），官网 appcast.xml 只会 308
+        // 到一张 404 网页；能拿到版本号的只剩发布说明页的时间轴。
+        // 这一页慢（实测 6~8 秒），用单独放开的 30 秒超时，别跟别的源抢 15 秒的线。
+        VendorRule(matches: { $0.bundleId == "com.ideasoncanvas.mindnode" }) { app, _, allowBeta in
+            let page = "https://mindnode.com/releases/"
+            guard let body = await Net.text(page, timeout: 30),
+                  let latest = mindNodeVersion(in: body) else {
+                // 页面没打开 / 改版了：如实说清楚，别用「官网页面没抓到版本号」这种
+                // 让人以为是 App 出问题的说法。下一次定时检查会重试。
+                return Checker.Outcome(status: .failed, latest: nil, url: page, homepage: page,
+                                       note: "MindNode 官网发布页没打开（这页偏慢，网络不稳时会这样）")
+            }
+            return verdict(app, latest: latest, url: page, allowBeta: allowBeta)
         }
     ]
 

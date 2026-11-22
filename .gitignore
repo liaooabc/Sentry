@@ -3,3 +3,5 @@ dist/
 .DS_Store
 *.dmg
 *.sha256
+# 每次装机前的 ditto 备份快照（历次积累能到 1GB），不属于源码
+backup-Applications-*/

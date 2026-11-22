@@ -6,5 +6,6 @@ cd "$(dirname "$0")/.."
 
 mkdir -p build
 swiftc -o build/ur_tests \
-    src/Models.swift src/Version.swift src/Checkers.swift src/Scanner.swift Tests/main.swift
+    src/Models.swift src/Version.swift src/Checkers.swift src/Scanner.swift \
+    src/ElectronUpdater.swift Tests/main.swift
 ./build/ur_tests

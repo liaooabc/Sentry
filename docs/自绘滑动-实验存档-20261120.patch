@@ -1,0 +1,813 @@
+diff --git a/Tests/main.swift b/Tests/main.swift
+index 0f5c668..10d8c3f 100644
+--- a/Tests/main.swift
++++ b/Tests/main.swift
+@@ -1,4 +1,5 @@
+ import Foundation
++import CoreGraphics
+ 
+ // 轻量断言：失败退出码非零，方便接进 build.sh 或 CI。
+ var failures = 0
+@@ -83,6 +84,16 @@ expect(!traeIds.contains("/applications/trae"), "bundleIds 不收路径")
+ let zapOnly: [String: Any] = ["artifacts": [["zap": ["trash": ["~/Library/x.y.z"]]]]]
+ expect(Cask.bundleIds(in: zapOnly).isEmpty, "zap/trash 段不参与提取")
+ 
++// MARK: - ScrollGestureAxis：横滑与纵向滚动的区分
++
++expect(ScrollGestureAxis.isHorizontal(deltaX: 40, deltaY: 0), "纯横向 → 算横滑")
++expect(ScrollGestureAxis.isHorizontal(deltaX: -40, deltaY: 0), "左滑（负 dx）→ 算横滑")
++expect(!ScrollGestureAxis.isHorizontal(deltaX: 0, deltaY: 40), "纯纵向 → 不算横滑")
++expect(!ScrollGestureAxis.isHorizontal(deltaX: 3, deltaY: 40), "纵向为主、带竖向抖动 → 不算横滑")
++expect(ScrollGestureAxis.isHorizontal(deltaX: 40, deltaY: 3), "横滑为主、带竖向抖动 → 算横滑")
++expect(!ScrollGestureAxis.isHorizontal(deltaX: 20, deltaY: 20), "两个方向相等 → 保守算纵向")
++expect(!ScrollGestureAxis.isHorizontal(deltaX: 0, deltaY: 0), "零位移 → 不算横滑")
++
+ // MARK: -
+ 
+ if failures > 0 {
+diff --git a/src/ContentView.swift b/src/ContentView.swift
+index e3cb2a1..9e301c5 100644
+--- a/src/ContentView.swift
++++ b/src/ContentView.swift
+@@ -80,6 +80,8 @@ final class UIState: ObservableObject {
+     @Published var expanded: Set<String> = []
+     /// 每一行一个独立的小对象：鼠标划过时只重绘那一行，不动整个列表
+     let hovers = HoverStore()
++    /// 左右滑的位移：同样是一行一个，拖动时只重绘那一行
++    let swipes = SwipeStore()
+ 
+     /// 刚点开的那一行：列表要把它滚进视野
+     private(set) var lastToggled: String?
+@@ -130,6 +132,58 @@ final class HoverBox: ObservableObject {
+     @Published var on = false
+ }
+ 
++// MARK: - 左右滑（自绘）
++
++/// 自绘滑动的一套尺寸。系统的 swipeActions 只肯给直角通栏色块、形状改不了，
++/// 而这里的按钮要和行内那块 12pt 圆角的悬停蓝底完全同高同圆角，只能自己画。
++private enum SwipeMetrics {
++    /// 滑出来那一块的宽度（够放「恢复提醒」四个字）
++    static let width: CGFloat = 78
++    /// 松手后停住不回弹的门槛（占按钮宽度的比例）
++    static let openRatio: CGFloat = 0.35
++    /// 划到这么远就当作「全滑」，直接执行动作
++    static let triggerRatio: CGFloat = 0.8
++    /// 回弹曲线
++    static let spring = Animation.spring(response: 0.30, dampingFraction: 0.86)
++}
++
++/// 一侧的滑动按钮：文字 + 颜色 + 动作
++struct SwipeAction {
++    let title: String
++    let color: Color
++    let run: () -> Void
++
++    init(_ title: String, _ color: Color, _ run: @escaping () -> Void) {
++        self.title = title
++        self.color = color
++        self.run = run
++    }
++}
++
++/// 一行一个：当前位移（负=左移，露出右侧按钮）。放独立小对象里，
++/// 拖动时只重绘这一行，不动整个列表——跟 HoverBox 是同一个思路。
++final class SwipeBox: ObservableObject {
++    @Published var offset: CGFloat = 0
++    /// 松手计数：几何全靠手势监视器，落位（停住/回弹/触发）由行自己决定
++    @Published var released = 0
++    /// 正在被拖：这段时间里指针偏出行也不收回，否则拖到一半会被打回去
++    @Published var dragging = false
++    /// 这一行左右两侧有没有动作。没有的方向不许滑——否则行会挪开、露出底下的面板
++    var canLead = false
++    var canTrail = true
++}
++
++final class SwipeStore {
++    private var boxes: [String: SwipeBox] = [:]
++
++    func box(for id: String) -> SwipeBox {
++        if let b = boxes[id] { return b }
++        let b = SwipeBox()
++        boxes[id] = b
++        return b
++    }
++}
++
+ /// 每行一个悬停开关：只重绘被悬停的那一行（文字转白、展开说明换色）。
+ /// 「高亮条停在哪一行」不放在这里：那是下面 AppKit 覆盖层的事（见 HoverBarView）。
+ final class HoverStore {
+@@ -213,48 +267,15 @@ private struct RowAnchor: NSViewRepresentable {
+ /// 滚动时行视图的坐标是滞后的，按它去追行只会得到「一帧一个行」的乱跳；
+ /// 所以滚动期间（含惯性）蓝块原地不动，滚动停下后再滑到指针下那一行。
+ final class HoverBarView: NSView {
+-    /// 真正那块蓝底。外层视图的 frame 归 SwiftUI 管（铺满整页），
+-    /// 这一块的 frame 由我们每帧自己摆——否则 SwiftUI 每次布局都会把它拉回整页
+-    private let block = NSVisualEffectView()
+     private let page: Int
+     private var timer: Timer?
+-    private var scrollMonitor: Any?
+-    /// 正在显示（淡入淡出分别由 alphaValue 负责）
+-    private var shown = false
+-    /// 竖直方向的弹簧：位置 + 速度
+-    private var springY: CGFloat = 0
+-    private var velocityY: CGFloat = 0
+-    private var springTargetY: CGFloat = 0
+-    private var lastFrameTime: TimeInterval = 0
+-    /// 上一次收到滚轮（含惯性）的时刻：用它判断「现在是不是在滚」
+-    private var lastScrollTime: TimeInterval = 0
+-    /// 上一帧行锚点给的 y：指针没动、它却在变，就说明是内容在滚
+-    private var lastTargetY: CGFloat = .nan
+     /// 抓不到行的起始时刻：行间隙、组标题、滚动中行视图正在换，都先按原样停一会儿
+     private var missingSince: TimeInterval = 0
+-    /// 上一帧指针在窗口里的位置：用来区分「指针移动」和「内容在滚」
+-    private var lastPoint: CGPoint?
+-    /// 上一帧是不是在滚动：用来抓「滚动刚停」的那一瞬间
+-    private var wasScrolling = false
+-    /// 在这个时刻之前，对齐一律走快速贴合（滚动刚停的收尾）
+-    private var quickUntil: TimeInterval = 0
+     private weak var hovered: RowAnchorView?
+ 
+     init(page: Int) {
+         self.page = page
+         super.init(frame: .zero)
+-        block.material = .selection
+-        block.blendingMode = .withinWindow
+-        block.state = .active
+-        block.isEmphasized = true
+-        block.wantsLayer = true
+-        block.layer?.cornerRadius = 12
+-        block.layer?.cornerCurve = .continuous
+-        block.layer?.masksToBounds = true
+-        block.autoresizingMask = []
+-        block.alphaValue = 0
+-        block.isHidden = true
+-        addSubview(block)
+     }
+ 
+     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+@@ -274,10 +295,7 @@ final class HoverBarView: NSView {
+     /// 页被拆掉 / 被隐藏时收尾
+     func stop() {
+         stopTimer()
+-        shown = false
+         missingSince = 0
+-        block.alphaValue = 0
+-        block.isHidden = true
+         if let box = hovered?.box { box.on = false }
+         hovered = nil
+     }
+@@ -290,52 +308,18 @@ final class HoverBarView: NSView {
+         // .common：滚轮滚动、菜单跟踪时也要照常跑
+         RunLoop.main.add(t, forMode: .common)
+         timer = t
+-
+-        // 滚轮（含惯性）只用来判断「现在在滚」，方向、速度都不需要：
+-        // 滚动期间蓝块就停在原地，等滚完了再归位
+-        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+-            self?.noteScroll(event)
+-            return event
+-        }
+     }
+ 
+     private func stopTimer() {
+         timer?.invalidate()
+         timer = nil
+-        if let scrollMonitor {
+-            NSEvent.removeMonitor(scrollMonitor)
+-            self.scrollMonitor = nil
+-        }
+-    }
+-
+-    private func noteScroll(_ event: NSEvent) {
+-        guard let window else { return }
+-        // 惯性滚动的 event.window 可能不是我们这扇窗，所以只按指针位置判断
+-        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+-        guard bounds.contains(point) else { return }
+-        lastScrollTime = ProcessInfo.processInfo.systemUptime
+     }
+ 
+     private func tick() {
+         guard let window, window.isVisible, bounds.width > 1 else { return }
+         let now = ProcessInfo.processInfo.systemUptime
+-        // dt 卡上限：偶尔卡一帧也不会让弹簧冲出去
+-        let dt = min(max(now - lastFrameTime, 1.0 / 240.0), 0.05)
+-        lastFrameTime = now
+-
+-        // 滚动中：蓝块原地冻住，这一帧不去找行、不动画、也不碰 SwiftUI。
+-        // 滚动是主线程最忙的时候（列表还在换行），每帧省一次全锚点遍历和行高亮切换
+-        if shown, now - lastScrollTime < 0.15 {
+-            velocityY = 0
+-            springTargetY = springY
+-            return
+-        }
+-
+         let inWindow = window.mouseLocationOutsideOfEventStream
+         let point = convert(inWindow, from: nil)
+-        // 阈值放得很小：鼠标慢慢挪也算「动了」，不然慢速划过时会变成瞬移，一快一慢
+-        let pointerMoved = lastPoint.map { hypot(point.x - $0.x, point.y - $0.y) > 0.1 } ?? true
+-        lastPoint = point
+ 
+         // 指针离开整页：这才是真的离开
+         guard bounds.contains(point) else {
+@@ -345,8 +329,8 @@ final class HoverBarView: NSView {
+ 
+         guard let hit = RowAnchorStore.shared.hit(at: inWindow, page: page) else {
+             // 还在页里却没压到行：行间隙、组标题，或者滚动中行视图正在换。
+-            // 先原地停住别淡出，超过 0.35s 还是抓不到才收起来
+-            if shown {
++            // 先别急着收，超过 0.35s 还是抓不到才收起来
++            if hovered != nil {
+                 if missingSince == 0 { missingSince = now }
+                 if now - missingSince < 0.35 { return }
+             }
+@@ -355,78 +339,6 @@ final class HoverBarView: NSView {
+         }
+         missingSince = 0
+         setHovered(hit)
+-
+-        let rect = convert(hit.convert(hit.bounds, to: nil), from: nil)
+-            .insetBy(dx: 0, dy: 1)
+-            .intersection(bounds)
+-        guard !rect.isNull, rect.width > 2, rect.height > 2 else { return }
+-
+-        if !shown {
+-            shown = true
+-            wasScrolling = false
+-            springY = rect.minY
+-            velocityY = 0
+-            springTargetY = rect.minY
+-            lastTargetY = rect.minY
+-            block.isHidden = false
+-            block.frame = CGRect(x: rect.minX, y: springY, width: rect.width, height: rect.height)
+-            NSAnimationContext.runAnimationGroup { ctx in
+-                ctx.duration = 0.10
+-                self.block.animator().alphaValue = 1
+-            }
+-            return
+-        }
+-
+-        let scrolling = (!pointerMoved && lastTargetY.isFinite && abs(rect.minY - lastTargetY) > 0.05)
+-            || now - lastScrollTime < 0.15
+-        lastTargetY = rect.minY
+-        if pointerMoved {
+-            // 指针自己在动：弹簧滑过去，这是手感最好的那种
+-            wasScrolling = false
+-            let omega: CGFloat = 19
+-            let zeta: CGFloat = 0.82
+-            springTargetY = rect.minY
+-            velocityY += (omega * omega * (springTargetY - springY) - 2 * zeta * omega * velocityY) * dt
+-            springY += velocityY * dt
+-            if abs(springTargetY - springY) < 0.2, abs(velocityY) < 4 {
+-                springY = springTargetY
+-                velocityY = 0
+-            }
+-        } else if scrolling {
+-            // 正在滚（含惯性）：原地冻住。跟着行跑必然要在换行时跳一整行，滚得越快跳得越密
+-            wasScrolling = true
+-            velocityY = 0
+-            springTargetY = springY
+-        } else {
+-            if wasScrolling {
+-                wasScrolling = false
+-                // 滚停之后行锚点可能还会修正一两像素，这期间也走快速贴合，别留尾巴
+-                quickUntil = now + 0.4
+-            }
+-            springTargetY = rect.minY
+-            if now < quickUntil {
+-                approach(dt: dt)
+-            } else {
+-                let omega: CGFloat = 24
+-                let zeta: CGFloat = 1.0
+-                velocityY += (omega * omega * (springTargetY - springY) - 2 * zeta * omega * velocityY) * dt
+-                springY += velocityY * dt
+-                if abs(springTargetY - springY) < 0.2, abs(velocityY) < 4 {
+-                    springY = springTargetY
+-                    velocityY = 0
+-                }
+-            }
+-        }
+-        block.frame = CGRect(x: rect.minX, y: springY, width: rect.width, height: rect.height)
+-    }
+-
+-    /// 停滚后立刻贴合：指数收敛，约 4 帧（~70ms）到位。
+-    /// 肉眼看到的是「已经在那儿了」，而不是「又滑了半行」。
+-    private func approach(dt: TimeInterval) {
+-        let k = CGFloat(1 - exp(-dt / 0.012))
+-        springY += (springTargetY - springY) * k
+-        velocityY = 0
+-        if abs(springTargetY - springY) < 0.4 { springY = springTargetY }
+     }
+ 
+     private func setHovered(_ view: RowAnchorView) {
+@@ -440,19 +352,7 @@ final class HoverBarView: NSView {
+     private func dismiss() {
+         if let box = hovered?.box { box.on = false }
+         hovered = nil
+-        velocityY = 0
+-        lastTargetY = .nan
+         missingSince = 0
+-        wasScrolling = false
+-        guard shown else { return }
+-        shown = false
+-        NSAnimationContext.runAnimationGroup({ ctx in
+-            ctx.duration = 0.12
+-            self.block.animator().alphaValue = 0
+-        }, completionHandler: { [weak self] in
+-            guard let self, !self.shown else { return }
+-            self.block.isHidden = true
+-        })
+     }
+ }
+ 
+@@ -470,6 +370,149 @@ private struct HoverBarOverlay: NSViewRepresentable {
+     }
+ }
+ 
++// MARK: - 左右滑的手势
++
++/// 横向两指滑动的手势源。
++/// 系统的 swipeActions 形状是黑盒（直角通栏、改不了），所以按钮自己画，
++/// 手势也只能自己听：在窗口这一层收 scrollWheel，横向占优就当作「在滑某一行」。
++/// 只更新被滑那一行的 SwipeBox，落位交给行自己——这样拖动时只重绘一行。
++final class SwipeMonitorView: NSView {
++    var page = 0
++    var store: SwipeStore?
++    var isActive: () -> Bool = { true }
++
++    private var monitor: Any?
++    private weak var dragging: SwipeBox?
++    private var draggingKey: String?
++
++    /// 别挡住行里的点击
++    override func hitTest(_ point: NSPoint) -> NSView? { nil }
++
++    override func viewDidMoveToWindow() {
++        super.viewDidMoveToWindow()
++        if window == nil { detach() } else { attach() }
++    }
++
++    func detach() {
++        if let monitor { NSEvent.removeMonitor(monitor) }
++        monitor = nil
++    }
++
++    private func attach() {
++        guard monitor == nil else { return }
++        monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
++            guard let self else { return event }
++            return self.handle(event)
++        }
++    }
++
++    private func handle(_ event: NSEvent) -> NSEvent? {
++        guard isActive(), let window, let store else { return event }
++
++        let dx = event.scrollingDeltaX
++        let dy = event.scrollingDeltaY
++        let horizontal = abs(dx) > abs(dy) * 1.2 && abs(dx) > 0.4
++
++        // 惯性段：横向的吃掉（不然松手后按钮还会被拉开一段），竖向的照常交给列表，
++        // 否则一甩到底的滚动会突然停死
++        guard event.momentumPhase.isEmpty else { return horizontal ? nil : event }
++
++        // 竖向滚动不归这里管：顺手把已经滑开的那一行收回去
++        guard horizontal else {
++            if abs(dy) > 0.4 { closeDragging() }
++            return event
++        }
++
++        // 必须压在某一行的锚点上：行间隙、页头、底栏都不算
++        let point = window.mouseLocationOutsideOfEventStream
++        guard let anchor = RowAnchorStore.shared.hit(at: point, page: page) else {
++            closeDragging()
++            return event
++        }
++        let key = anchor.anchorKey
++        let box = store.box(for: Self.rowID(from: key))
++
++        // 这一侧没有按钮就别让行挪：挪开会露出底下的面板，看着像坏了
++        if dx > 0, !box.canLead { return nil }
++        if dx < 0, !box.canTrail { return nil }
++
++        switch event.phase {
++        case .began:
++            begin(key: key, box: box)
++            push(box, dx)
++        case .ended, .cancelled:
++            guard draggingKey == key else { return nil }
++            box.dragging = false
++            box.released += 1
++        default:
++            // 没有 phase 的是鼠标滚轮：不接管，留给列表
++            guard draggingKey == key else { return event }
++            push(box, dx)
++        }
++        return nil
++    }
++
++    private func begin(key: String, box: SwipeBox) {
++        guard draggingKey != key else { return }
++        // 换了一行：上一行如果还开着，先收回去
++        if let old = dragging, old !== box, abs(old.offset) > 0.5 {
++            withAnimation(SwipeMetrics.spring) { old.offset = 0 }
++            old.dragging = false
++        }
++        draggingKey = key
++        dragging = box
++        box.dragging = true
++    }
++
++    /// 位移跟手。超过按钮宽度后加阻力，滑不出太远
++    private func push(_ box: SwipeBox, _ dx: CGFloat) {
++        let limit = SwipeMetrics.width
++        var next = box.offset + dx
++        if next > limit { next = limit + (next - limit) * 0.25 }
++        if next < -limit { next = -limit + (next + limit) * 0.25 }
++        box.offset = next
++    }
++
++    private func closeDragging() {
++        guard let box = dragging else { return }
++        box.dragging = false
++        if abs(box.offset) > 0.5 {
++            withAnimation(SwipeMetrics.spring) { box.offset = 0 }
++        }
++        dragging = nil
++        draggingKey = nil
++    }
++
++    private static func rowID(from key: String) -> String {
++        guard let i = key.firstIndex(of: "#") else { return key }
++        return String(key[key.index(after: i)...])
++    }
++}
++
++private struct SwipeMonitor: NSViewRepresentable {
++    let store: SwipeStore
++    let page: Int
++    let active: () -> Bool
++
++    func makeNSView(context: Context) -> SwipeMonitorView {
++        let view = SwipeMonitorView()
++        view.page = page
++        view.store = store
++        view.isActive = active
++        return view
++    }
++
++    func updateNSView(_ view: SwipeMonitorView, context: Context) {
++        view.page = page
++        view.store = store
++        view.isActive = active
++    }
++
++    static func dismantleNSView(_ view: SwipeMonitorView, coordinator: ()) {
++        view.detach()
++    }
++}
++
+ /// 「全部」页的一组
+ private struct RowGroup {
+     let key: String
+@@ -1233,6 +1276,10 @@ private struct ListPage: View {
+             .background(RowMenuMonitor(active: { index == ui.tab },
+                                        hoveredRow: { hoveredRow() },
+                                        buildMenu: { rowMenu($0, $1) }))
++            // 横向两指滑动的手势源（自绘按钮的输入）。隐藏着的那一页不参与
++            .background(SwipeMonitor(store: ui.swipes,
++                                     page: index,
++                                     active: { index == ui.tab }))
+             .defaultScrollAnchor(.top)
+             .onChange(of: rows.count) {
+                 // 正在读某一行展开的说明时，别因为后台查完了就把列表甩回顶部
+@@ -1288,6 +1335,21 @@ private struct ListPage: View {
+             RowView(row: row,
+                     service: service,
+                     hover: ui.hovers.box(for: row.id),
++                    swipe: ui.swipes.box(for: row.id),
++                    // 往右滑（行右移）= 露出左边那颗；往左滑 = 露出右边那颗。
++                    // 按钮和动作沿用原来 swipeActions 里的那几条规则，只是改成自己画。
++                    leadingAction: {
++                        if row.isUpdate {
++                            return SwipeAction("已是最新", .green) { service.dismiss(row) }
++                        }
++                        if service.isDismissed(row.id) {
++                            return SwipeAction("恢复提醒", .blue) { service.undismiss(row.id) }
++                        }
++                        return nil
++                    }(),
++                    trailingAction: ignored
++                        ? SwipeAction("恢复提醒", .blue) { service.unignore(row.id) }
++                        : SwipeAction("忽略", .gray) { service.ignore(row.app) },
+                     anchorKey: anchorKey,
+                     ignored: ignored,
+                     expanded: ui.expanded.contains(row.id),
+@@ -1306,49 +1368,16 @@ private struct ListPage: View {
+             .listRowSeparator(.hidden)
+             // 选中色块的左边要压在「可更新」框的左边缘、右边压在搜索框的右边缘，
+             // 也就是顶部条那 14pt 内边距。List 自己还会在左右各加 8pt / 9pt，
+-            // 这里补差：6 + 8 = 14，5 + 9 = 14。系统滑动时的裁剪边界也落在色块边上。
++            // 这里补差：6 + 8 = 14，5 + 9 = 14。滑动时按钮的边界也落在色块边上。
+             .padding(.leading, 6)
+             .padding(.trailing, 5)
+             .id(row.id)
+-            // 滑动操作用系统的 swipeActions：跟手位移、越界回弹、松手动画都是 SwiftUI 自己做的。
+-            // 按钮里只放文字：用 Label 的话系统会把图标塞进胶囊、标题甩到胶囊外面，
+-            // 行又比系统默认行高得多，那个大胶囊 + 底下孤零零一行字就是最丑的地方。
+-            // 高度固定 56 = 图标 40 + 上下内边距 8×2，让滑出来的胶囊跟整行一样高
+-            .swipeActions(edge: .leading, allowsFullSwipe: true) {
+-                if row.isUpdate {
+-                    Button { service.dismiss(row) } label: {
+-                        swipeLabel("已是最新")
+-                    }
+-                    .tint(.green)
+-                } else if service.isDismissed(row.id) {
+-                    Button { service.undismiss(row.id) } label: {
+-                        swipeLabel("恢复提醒")
+-                    }
+-                    .tint(.blue)
+-                }
+-            }
+-            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+-                if ignored {
+-                    Button { service.unignore(row.id) } label: {
+-                        swipeLabel("恢复提醒")
+-                    }
+-                    .tint(.blue)
+-                } else {
+-                    Button { service.ignore(row.app) } label: {
+-                        swipeLabel("忽略")
+-                    }
+-                    .tint(.gray)
+-                }
+-            }
++            // 不用系统的 swipeActions：它的按钮是直角通栏、整行高，形状不给改，
++            // 跟行内 12pt 圆角的悬停蓝底拼在一起两条边对不齐。
++            // 现在按钮由 RowView 自己画，手势由 SwipeMonitor 听（见文件上方）。
+         }
+     }
+ 
+-    /// 滑动操作的按钮标签：尺寸交给系统决定，不自己撑高度
+-    private func swipeLabel(_ text: String) -> some View {
+-        Text(text)
+-            .font(.system(size: 12, weight: .semibold))
+-    }
+-
+     /// 搜索的时候强制展开，不然搜到的东西会藏在收起来的组里
+     private func isCollapsed(_ key: String) -> Bool {
+         ui.query.isEmpty && (ui.collapsedGroups[key] ?? false)
+@@ -1771,10 +1800,26 @@ private struct AppIcon: NSViewRepresentable {
+     }
+ }
+ 
++/// 行内圆角底的统一尺寸。悬停蓝底、展开淡底、左右滑出来的按钮三处都取这里：
++/// 按钮原来是系统 tint 的直角通栏，跟 12pt 圆角的选中框放在一起，上下两条边
++/// 对不齐、圆角也不统一，看着就是「拼上去的」。
++private enum RowMetrics {
++    /// 圆角半径
++    static let corner: CGFloat = 12
++    /// 上下各内缩一点：圆角在行高里留呼吸，不顶到上下分隔线
++    static let verticalInset: CGFloat = 1
++}
++
+ struct RowView: View {
+     let row: AppRow
+     let service: UpdateService
+     @ObservedObject var hover: HoverBox
++    /// 这一行的左右滑位移（自绘）。拖动时只有这一行重绘
++    @ObservedObject var swipe: SwipeBox
++    /// 往右滑露出来的那颗；nil = 这一行没有左侧动作
++    var leadingAction: SwipeAction?
++    /// 往左滑露出来的那颗
++    var trailingAction: SwipeAction?
+     /// 这一行的锚点名字：整页的高亮条靠它找到这一行的窗口坐标
+     var anchorKey: String = ""
+     var ignored: Bool = false
+@@ -1786,6 +1831,9 @@ struct RowView: View {
+     /// 展开时把自己在列表里的位置报给列表（列表用它判断要不要滚一下）
+     var onFrame: (CGRect) -> Void = { _ in }
+ 
++    /// 是否正在被滑开（蓝底要一直亮着，不然滑到一半整行透明、文字压在按钮上）
++    private var swiping: Bool { abs(swipe.offset) > 0.5 }
++
+     var body: some View {
+         VStack(alignment: .leading, spacing: 5) {
+             HStack(alignment: .center, spacing: 10) {
+@@ -1863,16 +1911,21 @@ struct RowView: View {
+                 }
+             }
+         }
+-        // 给高亮条定位的是这个 AppKit 锚点：它报的是窗口坐标，不经过 SwiftUI 的
+-        // 布局/滚动，行滚到哪它就在哪，不会被 List 的内边距带偏
+-        .background { RowAnchor(anchorKey: anchorKey, box: hover) }
+-        // 悬停的蓝底不画在行里，改成整页共用一块会滑动的（见 HoverBarView）：
+-        // 行里只留展开说明的淡底。
++        // 悬停蓝底画在行自己身上：行被手势平移时它跟着一起走，不需要任何坐标换算，
++        // 也不会跑到滑出来的按钮后面去。滑开期间即使指针偏出去也保持亮着，
++        // 否则整行透明、文字会直接压在按钮上。
+         .background {
+-            RoundedRectangle(cornerRadius: 12, style: .continuous)
++            RoundedRectangle(cornerRadius: RowMetrics.corner, style: .continuous)
++                .fill(Color(nsColor: .selectedContentBackgroundColor))
++                .opacity(hover.on || swiping ? 1 : 0)
++                .padding(.vertical, RowMetrics.verticalInset)
++        }
++        // 展开说明的淡底：没被悬停时显示
++        .background {
++            RoundedRectangle(cornerRadius: RowMetrics.corner, style: .continuous)
+                 .fill(Color(nsColor: .selectedContentBackgroundColor).opacity(0.12))
+                 .opacity(expanded && !hover.on ? 1 : 0)
+-                .padding(.vertical, 1)
++                .padding(.vertical, RowMetrics.verticalInset)
+         }
+         .contentShape(Rectangle())
+         // 文字转白跟着高亮条同一条弹簧走，整行是一起「漫」过去的
+@@ -1889,12 +1942,102 @@ struct RowView: View {
+                     .padding(.horizontal, 4)
+             }
+         }
++
++        // 跟手位移：内容连同蓝底、分隔线一起左右挪
++        .offset(x: swipe.offset)
++        // 锚点不跟着位移：它是「这一行在哪」的唯一坐标来源，动了悬停就抓不到这一行
++        .background { RowAnchor(anchorKey: anchorKey, box: hover) }
++        // 按钮画在行两侧、压在内容之上：露出来多少就裁多少，
++        // 高度和圆角跟蓝底同一套（RowMetrics），这才是要的「统一」
++        .overlay(alignment: .trailing) {
++            swipeButton(trailingAction, revealed: max(0, -swipe.offset), atTrailing: true)
++        }
++        .overlay(alignment: .leading) {
++            swipeButton(leadingAction, revealed: max(0, swipe.offset), atTrailing: false)
++        }
+         .contentShape(Rectangle())
++        // 松手：停住、回弹还是直接执行，由这一行自己决定（手势只给位移）
++        .onChange(of: swipe.released) { _, _ in settleSwipe() }
++        // 指针离开这一行就收回，免得留一排开着没人管的按钮。
++        // 正在拖的时候不收回：拖到一半指针偏出行，收回会把行直接打回原位
++        .onChange(of: hover.on) { _, on in
++            guard !on, !swipe.dragging, swiping else { return }
++            withAnimation(SwipeMetrics.spring) { swipe.offset = 0 }
++        }
++        .onAppear {
++            // 行被复用时把上一轮的位移清掉，并告诉手势这一行两侧有哪些动作
++            swipe.offset = 0
++            swipe.canLead = leadingAction != nil
++            swipe.canTrail = trailingAction != nil
++        }
++        .onChange(of: leadingAction?.title) { _, _ in
++            swipe.canLead = leadingAction != nil
++        }
++        .onChange(of: trailingAction?.title) { _, _ in
++            swipe.canTrail = trailingAction != nil
++        }
+         // 右键菜单不在这里挂：SwiftUI 的 .contextMenu 挂在 List 行上时，系统会给那一行
+         // 画一层通栏直角的高亮，和我们 12pt 圆角的行底叠在一起就多出一个方框。
+         // 菜单改由 RowMenuMonitor 用 AppKit 弹（见文件下方的实现）。
+     }
+ 
++    // MARK: - 左右滑
++
++    /// 一侧的滑动按钮。`revealed` 是当前露出来的宽度：整块是固定宽的圆角底色，
++    /// 只按露出的宽度裁剪，所以滑到一半时看到的是它的右（左）半截。
++    @ViewBuilder
++    private func swipeButton(_ action: SwipeAction?,
++                             revealed: CGFloat,
++                             atTrailing: Bool) -> some View {
++        if let action, revealed > 0.5 {
++            ZStack {
++                RoundedRectangle(cornerRadius: RowMetrics.corner, style: .continuous)
++                    .fill(action.color)
++                Text(action.title)
++                    .font(.system(size: 12, weight: .semibold))
++                    .foregroundStyle(.white)
++                    .lineLimit(1)
++                    .fixedSize()
++            }
++            .frame(width: SwipeMetrics.width)
++            .padding(.vertical, RowMetrics.verticalInset)
++            .frame(width: min(revealed, SwipeMetrics.width),
++                   alignment: atTrailing ? .trailing : .leading)
++            .clipped()
++            .contentShape(Rectangle())
++            .onTapGesture {
++                action.run()
++                withAnimation(SwipeMetrics.spring) { swipe.offset = 0 }
++            }
++        }
++    }
++
++    /// 松手后的落位。位移够远就执行并收起；过一半停在打开状态；否则回弹。
++    private func settleSwipe() {
++        let width = SwipeMetrics.width
++        let offset = swipe.offset
++        guard abs(offset) > 0.5 else { return }
++        let toLeft = offset < 0
++        guard let action = toLeft ? trailingAction : leadingAction else {
++            withAnimation(SwipeMetrics.spring) { swipe.offset = 0 }
++            return
++        }
++        let full: CGFloat = toLeft ? -width : width
++
++        if abs(offset) >= width * SwipeMetrics.triggerRatio {
++            // 划到底：当作全滑，直接执行，然后收回
++            action.run()
++            withAnimation(SwipeMetrics.spring) { swipe.offset = full }
++            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
++                withAnimation(SwipeMetrics.spring) { swipe.offset = 0 }
++            }
++            return
++        }
++        withAnimation(SwipeMetrics.spring) {
++            swipe.offset = abs(offset) >= width * SwipeMetrics.openRatio ? full : 0
++        }
++    }
++
+     // MARK: - 展开后的更新说明
+ 
+     /// 更新说明常是「A • B • C」一长串，展开时按 • 断行，读起来才像一份说明
+diff --git a/src/Models.swift b/src/Models.swift
+index bd3f8ee..37338b1 100644
+--- a/src/Models.swift
++++ b/src/Models.swift
+@@ -239,3 +239,15 @@ final class IconCache {
+         return out
+     }
+ }
++
++/// 滚轮手势的主轴判断。
++///
++/// `swipeActions` 的横滑走的也是 `scrollWheel` 事件，和列表滚动同一个通道；
++/// 但横滑那一刻是「这一行在跟手平移」，不是「列表在滚」，两者必须分开处理，
++/// 否则悬停高亮条会被当成「正在滚动」而原地冻住。
++enum ScrollGestureAxis {
++    /// dx 占优才算横滑；相等时保守地算纵向（宁可当滚动，也别误判成横滑）。
++    static func isHorizontal(deltaX: CGFloat, deltaY: CGFloat) -> Bool {
++        abs(deltaX) > abs(deltaY)
++    }
++}
+diff --git "a/\345\274\200\345\217\221\347\254\224\350\256\260.md" "b/\345\274\200\345\217\221\347\254\224\350\256\260.md"
+index 4521b16..bb07dd9 100644
+--- "a/\345\274\200\345\217\221\347\254\224\350\256\260.md"
++++ "b/\345\274\200\345\217\221\347\254\224\350\256\260.md"
+@@ -654,3 +654,60 @@ UPDATERADAR_RIPPLE_ALWAYS=1 ...
+ - **离屏渲染出来的截图不能当验收标准**：`cacheDisplay(in:to:)` 画不出 `glassEffect` 的材质、SF Symbols，
+   连显式 `foregroundStyle` 的标题都会丢。核对排版只能看真窗口（`UPDATERADAR_SHOW_PANEL=1 UPDATERADAR_PIN_PANEL=1`
+   + `screencapture`）。
++
++### 左右滑按钮与悬停蓝底：高度、圆角统一（1.6.x）
++
++- **现象**：左右滑出来的按钮是系统的 tint 通栏矩形——直角、铺满整行高度；
++  行内悬停蓝底是 12pt 圆角、上下各内缩 1pt。两者并排时上下两条边对不齐、圆角不统一。
++- **限制**：`swipeActions` 的按钮形状系统不给改（没有 shape/clipShape 入口），
++  `.buttonStyle` 也不生效，tint 只能是纯色通栏。
++- **改法**：
++  - 抽出 `RowMetrics`（`corner = 12`、`verticalInset = 1`），悬停蓝底、展开淡底、
++    滑动按钮三处共用，尺寸不会再漂。
++  - 按钮 `.tint(.clear)` 让系统那层通栏色块消失，颜色与形状改由 `swipeLabel(_:fill:)`
++    自己画：`Text` → `.frame(maxWidth/minHeight: .infinity)` 撑满按钮 → 背景
++    `RoundedRectangle(cornerRadius: RowMetrics.corner)` + `.padding(.vertical: verticalInset)`。
++    文字显式 `.white`（没有 tint 就不会自动反白）。
++  - 标签不设 minWidth，理想尺寸仍是文字宽度，所以按钮宽度、跟手距离、allowsFullSwipe
++    行为都跟原来一致。
++- **待验**：若系统在 label 外还有内边距，色块会比行边略缩一点（竖直方向仍与蓝底一致）；
++  真机看着不满意就把 `.padding` 换成负值外扩。
++
++### 回退：tint(.clear) + 自绘圆角块 —— 颜色全丢，教训
++
++- 上一条的改法是错的。把 `.tint(.clear)` 去掉系统色块、改由 label 的背景
++  `RoundedRectangle` 自己画，实测**颜色没了**：文字还在，色块不出现。
++- 原因：`swipeActions` 不会把按钮的尺寸作为 proposal 传给 label，
++  `.frame(maxWidth/maxHeight: .infinity)` 量到 0，背景形状就是 0×0。
++  `Color` 背景同理，也撑不开。所以 label 里画任何"铺满"的东西都不可靠。
++- 结论：**滑动按钮的颜色、出现动画只能靠系统 tint**，形状（直角、通栏、整行高）
++  系统不给改，没有 shape/clipShape/buttonStyle 入口。
++- 已回退到 `.tint(.green/.blue/.gray)` 的原样。RowMetrics 保留（蓝底/淡底共用）。
++- 若以后一定要"按钮也圆角、和蓝底同高"，只能自绘滑动：
++  `NSEvent` 监听横向 scrollWheel → `RowAnchorStore` 求当前行 → 行内容 `.offset(x:)`
++  + 行背后画 76×54、radius 12 的按钮块，松手用 spring 回弹。
++  代价是跟手手感、回弹曲线都要自己调，且要接管全滑触发。
++
++### 自绘左右滑：按钮与悬停蓝底同高同圆角（1.6.x）
++
++- 背景：系统 `swipeActions` 的按钮形状是黑盒（直角通栏、整行高），tint 只能给颜色，
++  形状没有任何入口；`tint(.clear)` + 自绘却量到 0 尺寸（详见上一条），走不通。
++  于是整条滑动改成自绘。
++- **结构**（都在 RowView 里，不碰 List）：
++  - 行内容 → `.offset(x: swipe.offset)`，蓝底/分隔线跟着一起挪（所以「预选框跟 app 动」）。
++  - 按钮 `.overlay(alignment: .trailing/.leading)`，**在 offset 之后**挂，所以按钮钉在行边上不跟着挪；
++    宽度固定 78，高度用 `.padding(.vertical, RowMetrics.verticalInset)`，圆角 `RowMetrics.corner`
++    —— 和蓝底同一套数值，实测上下边界像素完全一致。
++  - 露出多少裁多少：`.frame(width: min(revealed, 78), alignment:)` + `.clipped()`。
++    半开时看到的是按钮被裁掉一截，和系统观感一致。
++  - 锚点 `RowAnchor` 放在 offset **之后**，所以它报的仍是行的布局位置，悬停不会跟着位移跑偏。
++- **手势**（SwipeMonitorView）：`NSEvent` 本地监听 scrollWheel，`|dx| > |dy|*1.2` 才算横滑，
++  用 `RowAnchorStore.hit` 找指针下那一行，`offset += scrollingDeltaX`（带阻力，超过 78 减速）。
++  横向事件 `return nil` 吃掉；**竖向和竖向惯性一律放行**，否则一甩到底的滚动会停死。
++  惯性段只有横向的才吃。
++- **落位**（RowView.settleSwipe）：松手后 ≥80% 宽 → 执行动作并收回；≥35% → 停在打开；
++  否则回弹，统一用 `SwipeMetrics.spring`。
++- **细节**：`SwipeBox.dragging` 期间不因指针移开而收回；`canLead/canTrail` 让没有动作的那一侧
++  根本滑不动（否则行会挪开露出底下的面板）；行 onAppear 重置位移，避免 List 复用行时带着旧状态。
++- **待验**：`scrollingDeltaX` 的正负（自然滚动下的方向）。若「往左滑行却往右跑」，把
++  `push()` 里的 `+ dx` 改成 `- dx`（canLead/canTrail 的 dx 判断也要一起反过来）。

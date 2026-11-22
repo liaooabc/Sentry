@@ -119,6 +119,34 @@ func latestIsInstalledBuild(_ latest: String, current: String, build: String?) -
     return false
 }
 
+/// 把版本号尾巴上括起来的构建号拆出去：`1.58.0 (91297)` → (`1.58.0`, `91297`)。
+///
+/// 实测（Dia）：appcast 的 `shortVersionString` 写的是 `1.58.0 (91297)`，
+/// 本机 `CFBundleShortVersionString` 是 `1.58.0`。整串拿去比就成了
+/// 「1.58.0 (91297) 比 1.58.0 新」，装到最新了还天天挂着一个「可更新」。
+/// 括号里那串只是构建号（跟 `CFBundleVersion` 一致），不影响版本号高低。
+///
+/// 只认「括号里全是数字或点」的写法，别把 `2.0 (Beta)`、`1.0 (Universal)` 这种真标签吃掉。
+func splitTrailingBuild(_ raw: String) -> (version: String, build: String?) {
+    let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let last = s.last, last == ")" || last == "）" else { return (s, nil) }
+    guard let open = s.lastIndex(where: { $0 == "(" || $0 == "（" }) else { return (s, nil) }
+    let inner = s[s.index(after: open)..<s.index(before: s.endIndex)]
+        .trimmingCharacters(in: .whitespaces)
+    let head = String(s[s.startIndex..<open]).trimmingCharacters(in: .whitespaces)
+    guard !head.isEmpty, !inner.isEmpty,
+          inner.allSatisfy({ $0.isNumber || $0 == "." }),
+          head.contains(where: { $0.isNumber }) else { return (s, nil) }
+    return (head, inner)
+}
+
+/// 更新源给的构建号跟本机的一模一样 → 装的就是这个包（Dia 的 `sparkle:version` 91297）。
+func sameBuild(_ source: String?, _ installed: String?) -> Bool {
+    guard let a = source?.trimmingCharacters(in: .whitespaces), !a.isEmpty,
+          let b = installed?.trimmingCharacters(in: .whitespaces), !b.isEmpty else { return false }
+    return Ver.compare(a, b) == .orderedSame
+}
+
 private func numericTokens(_ s: String) -> [String] {
     s.split(whereSeparator: { !$0.isNumber }).map(String.init).filter { !$0.isEmpty }
 }

@@ -24,6 +24,8 @@ final class UpdateService: ObservableObject {
     private var didBootstrap = false
     /// 扫描正在进行（防止连点「扫描」叠起来跑）
     private var scanning = false
+    /// 「最近使用」时间上一次补刷的时刻（限流用：60 秒内不重复查索引）
+    private var lastUsedRefreshedAt: Date?
     /// 监听 Applications 目录，装/卸 App 后自动重扫
     private var watcher: AppDirWatcher?
     /// 重扫防抖：一次安装会连着吐好几个 FSEvents
@@ -213,7 +215,7 @@ final class UpdateService: ObservableObject {
                 // 先塞满并发槽位
                 while inFlight < Self.maxConcurrentChecks, let app = next.next() {
                     let prev = self.results[app.id]     // 官网安装包指纹要比上一轮的结果
-                    group.addTask { await Checker.check(app, previous: prev, allowBeta: allowBeta) }
+                    group.addTask { await Checker.check(app, previous: prev, allowBeta: allowBeta, forceCask: force) }
                     inFlight += 1
                 }
 
@@ -224,7 +226,7 @@ final class UpdateService: ObservableObject {
                     // 回来一个就补一个，别等整批
                     if let app = next.next() {
                         let prev = self.results[app.id]
-                        group.addTask { await Checker.check(app, previous: prev, allowBeta: allowBeta) }
+                        group.addTask { await Checker.check(app, previous: prev, allowBeta: allowBeta, forceCask: force) }
                         inFlight += 1
                     }
                     self.progress = Double(done) / total
@@ -252,6 +254,7 @@ final class UpdateService: ObservableObject {
         if app.isAppStore { return 3 }
         if Rules.match(app) != nil { return 2 }
         if app.sparkleFeed != nil { return 1 }
+        if app.electronFeed != nil { return 1 }
         return 0
     }
 
@@ -355,6 +358,48 @@ final class UpdateService: ObservableObject {
         save()
     }
 
+    /// 换排序方式。纯界面偏好，不触发重查，只让两份列表重排。
+    /// 切到「最近使用」时顺手刷一次时间：不然看到的是上次扫描那时的顺序。
+    func setSort(_ mode: SortMode) {
+        guard settings.sortOrder != mode.rawValue else { return }
+        settings.sortOrder = mode.rawValue
+        save()
+        if mode == .recent { refreshLastUsed(force: true) }
+    }
+
+    /// 换外观。纯界面偏好，存盘后由 AppDelegate 监听设置变化去落 NSApp.appearance ——
+    /// service 里不碰 NSApp，免得后台线程路径也能改到界面状态。
+    func setAppearance(_ mode: AppAppearance) {
+        guard settings.appearanceMode != mode else { return }
+        settings.appearance = mode.rawValue
+        save()
+    }
+
+    /// 补刷「最近使用」时间（只读 Spotlight 的 kMDItemLastUsedDate，不动检测结果）。
+    /// 只在排序方式就是「最近使用」时才值得跑，并且两次之间至少隔 60 秒 ——
+    /// 面板开开关关很频繁，每次都全量查一遍索引没必要。
+    func refreshLastUsed(force: Bool = false) {
+        guard settings.sort == .recent, !apps.isEmpty else { return }
+        if !force, let last = lastUsedRefreshedAt, Date().timeIntervalSince(last) < 60 { return }
+        lastUsedRefreshedAt = Date()
+        let snapshot = apps
+        Task { [weak self] in
+            let map = await Task.detached(priority: .utility) {
+                Scanner.lastUsedMap(paths: snapshot.map(\.path))
+            }.value
+            guard let self else { return }
+            var changed = false
+            for index in self.apps.indices {
+                guard let date = map[self.apps[index].path] else { continue }
+                if self.apps[index].lastUsedAt != date {
+                    self.apps[index].lastUsedAt = date
+                    changed = true
+                }
+            }
+            if changed { self.rebuild() }
+        }
+    }
+
     /// 用户说「这个已经是最新」：记下当时的商店版本号，商店再涨版本会自动恢复提醒
     func dismiss(_ row: AppRow) {
         var map = settings.dismissed ?? [:]
@@ -393,8 +438,8 @@ final class UpdateService: ObservableObject {
         let affected = Set(rows.compactMap { row -> String? in
             guard let r = row.result else { return nil }
             if on {
-                // 打开：appcast 源的 App 都可能藏着 beta，全都重看一眼
-                if r.source == "sparkle" { return row.id }
+                // 打开：appcast / electron 清单源的 App 都可能藏着 beta，全都重看一眼
+                if r.source == "sparkle" || r.source == "electron" { return row.id }
             } else {
                 // 关掉：现在正在提示测试版的那几条要立刻改判
                 if let l = r.latest, isPrereleaseVersion(l) { return row.id }

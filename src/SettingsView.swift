@@ -34,7 +34,17 @@ struct PanelSettingsView: View {
         Binding(get: { service.settings.hideFailedEnabled }, set: { service.setHideFailed($0) })
     }
     private var notifyOnUpdates: Binding<Bool> {
-        Binding(get: { service.settings.notifyEnabled }, set: { service.setNotify($0) })
+        Binding(get: { service.settings.notifyEnabled },
+                set: { on in
+                    service.setNotify(on)
+                    // 还没问过权限时，用户主动打开这一项就是请求授权的好时机
+                    if on, notifier.authorization == .notDetermined {
+                        notifier.requestPermission()
+                    }
+                })
+    }
+    private var appearance: Binding<AppAppearance> {
+        Binding(get: { service.settings.appearanceMode }, set: { service.setAppearance($0) })
     }
     /// 登录项：状态归系统（SMAppService）管，不落到 state.json，所以每次打开这一页都重读一次
     private var openAtLogin: Binding<Bool> {
@@ -76,6 +86,19 @@ struct PanelSettingsView: View {
             }
 
             section("显示") {
+                // 外观放这一组第一行：都是「界面长什么样」的开关，
+                // 单开一组会让整页多出一屏、底下要滚，不值当。
+                SettingRow(symbol: "circle.lefthalf.filled", title: "外观") {
+                    Picker("", selection: appearance) {
+                        ForEach(AppAppearance.allCases) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .controlSize(.small)
+                    .frame(width: 132)
+                }
                 SettingRow(symbol: "power", title: "登录时打开") {
                     Toggle("", isOn: openAtLogin).labelsHidden().toggleStyle(.switch).controlSize(.mini)
                 }
@@ -100,23 +123,26 @@ struct PanelSettingsView: View {
 
             section("通知") {
                 SettingRow(symbol: "bell", title: "有新版本时通知我") {
-                    Toggle("", isOn: notifyOnUpdates)
-                        .labelsHidden()
-                        .toggleStyle(.switch)
-                        .controlSize(.mini)
-                        .disabled(notifier.authorization == .denied)
+                    if notifier.authorization == .denied {
+                        // 系统层关了通知，这时候给一个开关是骗人的：点了也变不成开、通知也发不出来。
+                        // 直接给一条去系统设置的路，点一下就能到 Sentry 那一页。
+                        Button("去允许") { notifier.openSystemSettings() }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                    } else {
+                        Toggle("", isOn: notifyOnUpdates)
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .controlSize(.mini)
+                    }
                 }
                 SettingRow(symbol: "bell.badge", title: "系统通知") {
                     HStack(spacing: 8) {
                         Text(notificationStatusText)
                             .font(.system(size: 12, weight: .medium))
-                        Button("打开设置…") {
-                            if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") {
-                                NSWorkspace.shared.open(url)
-                            }
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
+                        Button("打开设置…") { notifier.openSystemSettings() }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
                     }
                 }
             }
@@ -143,7 +169,8 @@ struct PanelSettingsView: View {
             // 「Sentry」分组（当前版本 + 检查更新 / 安装）已搬到关于页，这里不再重复
         }
         .padding(.horizontal, 14)
-        .padding(.top, 4)
+        // 顶部留白比底部大一点：面板没有标题栏，第一组标题贴着玻璃上沿会显得「顶到天花板」
+        .padding(.top, 16)
         .padding(.bottom, 10)
         // 用户可能刚在系统设置里改过通知权限 / 登录项，这一页一露脸就按系统真实状态重画
         .onAppear {
