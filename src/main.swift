@@ -42,13 +42,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 所以「点图标」不能被当成「点别处」：应用失活、全局点击两条收起路径都要放行。
     private var statusItemRect: NSRect = .zero
 
-    // 扫描时图标不动，外面荡两圈很淡的"雷达波"（往里起、往外扩、边扩边淡）。
-    private var rippling = false
+    // 扫描时图标本身不动：底图换成「无点版」，三个点沿开口环转圈（加载效果）。
+    private var scanAnimating = false
     private var iconLayer: CALayer?
-    private var rippleLayers: [CAShapeLayer] = []
-    private static let rippleStartRatio: CGFloat = 0.566  // 从圆环内沿起（占图标半宽的比）
-    private static let rippleEndRatio: CGFloat = 0.956    // 扩到框边
-    private static let ripplePeriod: CFTimeInterval = 1.6
+    private var spinnerLayer: CALayer?
+    private var dotLayers: [CAShapeLayer] = []
+    /// 轨道/点半径按 SVG 的 22 画布等比取，改图标尺寸时自动跟随，不用手调
+    private static let dotOrbitRatio: CGFloat = 9.6 / 22   // 环外沿再外一点（7.6 + 描边1 + 点1）
+    private static let dotRadiusRatio: CGFloat = 1.0 / 22  // 点直径 2；放环外才看得见在转
+    private static let dotAngles: [CGFloat] = [-26, 0, 26] // 静止时三点位置（相对正上，度）
+    private static let spinPeriod: CFTimeInterval = 1.1    // 转一圈
 
     private let panelSize = NSSize(width: PanelMetrics.width, height: PanelMetrics.height)
     /// NSPopover 的 contentSize 就是整块玻璃的大小，内容直接铺满；
@@ -138,12 +141,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // 扫描时菜单栏图标往外荡雷达波，扫完停回原样
+        // 扫描时菜单栏图标的三个点沿环转，扫完停回原样
         bobCancellable = service.$checking
             .receive(on: RunLoop.main)
             .sink { [weak self] checking in
                 Task { @MainActor in
-                    if checking { self?.startRippling() } else { self?.stopRippling() }
+                    if checking { self?.startScanAnimation() } else { self?.stopScanAnimation() }
                 }
             }
 
@@ -593,14 +596,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateBadge() {
         guard let button = statusItem.button else { return }
         let n = service.updateCount
-        if !rippling { button.image = makeStatusIcon() }
+        if !scanAnimating { button.image = makeStatusIcon() }
         button.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
         button.title = (n > 0 && service.settings.countVisible) ? " \(n)" : ""
         // 菜单栏那颗图标不挂 tooltip：小夭说系统这个黄色气泡「有点烦人」，
         // 有没有新版本看角标数字就够了（2026-11-21）。
     }
 
-    // MARK: - 扫描时"雷达波"
+    // MARK: - 扫描时三个点沿环转
 
     /// 模板图是「黑剪影 + alpha」，塞进 CALayer 不会跟菜单栏明暗走，
     /// 所以按当前外观染一份再交给图层。
@@ -638,16 +641,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return img
     }
 
-    private func circlePath(center: CGPoint, radius: CGFloat) -> CGPath {
-        CGPath(ellipseIn: CGRect(x: center.x - radius, y: center.y - radius,
-                                 width: radius * 2, height: radius * 2), transform: nil)
+    /// 单个点的圆路径，中心在 (x, y)、半径 r。
+    private func dotPath(x: CGFloat, y: CGFloat, r: CGFloat) -> CGPath {
+        CGPath(ellipseIn: CGRect(x: x - r, y: y - r, width: r * 2, height: r * 2), transform: nil)
     }
 
-    /// 扫描时图标本身不动，从环里往外荡两圈"雷达波"（一圈接一圈，很快但很淡）。
-    /// 菜单栏只有 17pt，动整个图标或者让箭头滚过去都会糊成一团；涟漪只加淡环，最干净。
-    private func startRippling() {
-        guard !rippling, let button = statusItem.button else { return }
-        rippling = true
+    /// 扫描时的加载动画：底图换成「无点版」（只剩开口环 + 箭头），
+    /// 三个点沿环中线转圈。菜单栏只有 17pt，点与环同粗（直径 2），
+    /// 不叠任何淡环/波纹，避免糊成一团。
+    private func startScanAnimation() {
+        guard !scanAnimating, let button = statusItem.button else { return }
+        scanAnimating = true
 
         let size = makeStatusIcon().size
         button.image = blankIcon(size: size)
@@ -661,73 +665,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             rect = cell.imageRect(forBounds: button.bounds)
         }
 
-        // 图标本体：一直不动
+        // 底图：无点版。跟静态图同一套几何，只是少了那三个点（由动画层来画）。
         let icon = CALayer()
         icon.frame = rect
         icon.contentsGravity = .resizeAspect
         icon.contentsScale = scale
-        icon.contents = tintedCGImage(makeStatusIcon(), color: color, scale: scale)
+        icon.contents = tintedCGImage(makeStatusIcon(baseOnly: true), color: color, scale: scale)
         button.layer?.addSublayer(icon)
         iconLayer = icon
 
-        // 涟漪：两条弧线同时往外扩、边扩边淡，错开半个周期，看着是连续往外推
+        // 三个点放进一个容器层，容器绕中心转 = 点沿环跑。
+        // geometryFlipped 让容器内部 y 向下，跟 SVG 坐标一致（0° 在正上方）。
+        let spinner = CALayer()
+        spinner.frame = rect
+        spinner.contentsScale = scale
+        spinner.isGeometryFlipped = true
+        button.layer?.addSublayer(spinner)
+        spinnerLayer = spinner
+
+        let side = min(rect.width, rect.height)
+        let orbit = side * Self.dotOrbitRatio
+        let dotR = side * Self.dotRadiusRatio
         let center = CGPoint(x: rect.width / 2, y: rect.height / 2)
-        // 涟漪按图标半宽取比例，改图标尺寸时不用再手调这两个半径
-        let half = min(rect.width, rect.height) / 2
-        let rippleStart = half * Self.rippleStartRatio
-        let rippleEnd = half * Self.rippleEndRatio
-        for i in 0..<2 {
-            let wave = CAShapeLayer()
-            wave.frame = rect
-            wave.fillColor = nil
-            wave.strokeColor = color.withAlphaComponent(0.7).cgColor
-            wave.lineWidth = 1.3
-            wave.path = circlePath(center: center, radius: rippleStart)
-            wave.opacity = 0
-            button.layer?.addSublayer(wave)
-            rippleLayers.append(wave)
-
-            let grow = CABasicAnimation(keyPath: "path")
-            grow.fromValue = circlePath(center: center, radius: rippleStart)
-            grow.toValue = circlePath(center: center, radius: rippleEnd)
-
-            let fade = CAKeyframeAnimation(keyPath: "opacity")
-            fade.values = [0, 1, 1, 0]
-            fade.keyTimes = [0, 0.12, 0.55, 1]
-
-            for anim in [grow, fade] {
-                anim.duration = Self.ripplePeriod
-                anim.repeatCount = .infinity
-                anim.isRemovedOnCompletion = false
-                anim.timeOffset = CFTimeInterval(i) * Self.ripplePeriod / 2
-            }
-            wave.add(grow, forKey: "grow")
-            wave.add(fade, forKey: "fade")
+        for deg in Self.dotAngles {
+            let rad = deg * .pi / 180
+            let x = center.x + orbit * CGFloat(sin(rad))
+            let y = center.y - orbit * CGFloat(cos(rad))
+            let dot = CAShapeLayer()
+            dot.path = dotPath(x: x, y: y, r: dotR)
+            dot.fillColor = color.cgColor
+            dot.contentsScale = scale
+            spinner.addSublayer(dot)
+            dotLayers.append(dot)
         }
+
+        let spin = CABasicAnimation(keyPath: "transform.rotation.z")
+        spin.fromValue = 0
+        spin.toValue = 2 * CGFloat.pi
+        spin.duration = Self.spinPeriod
+        spin.repeatCount = .infinity
+        spin.isRemovedOnCompletion = false
+        spin.timingFunction = CAMediaTimingFunction(name: .linear)
+        spinner.add(spin, forKey: "spin")
     }
 
-    private func stopRippling() {
-        guard rippling else { return }
-        rippling = false
-        for layer in rippleLayers + [iconLayer].compactMap({ $0 }) {
+    private func stopScanAnimation() {
+        guard scanAnimating else { return }
+        scanAnimating = false
+        let layers: [CALayer] = dotLayers + [spinnerLayer, iconLayer].compactMap { $0 }
+        for layer in layers {
             layer.removeAllAnimations()
             layer.removeFromSuperlayer()
         }
-        rippleLayers = []
+        dotLayers = []
+        spinnerLayer = nil
         iconLayer = nil
         statusItem.button?.image = makeStatusIcon()
     }
 
-    /// 菜单栏图标：18pt 的自绘模板图（圆圈 + 圆润箭头），跟最初那版一模一样。
-    /// 走模板图，黑色由系统按菜单栏明暗自动换成白 —— 不做彩色、不缩放。
-    private func makeStatusIcon() -> NSImage {
-        // 优先用 asset catalog 里的模板图（Resources/Assets.xcassets/SentryMenuBar.svg）：
-        // 矢量、任意缩放都清晰，设计师能直接改。template 渲染，系统按菜单栏明暗自动反色。
+    /// 菜单栏图标：模板图（开口环 + 三个点 + 箭头）。走 template 渲染，
+    /// 系统按菜单栏明暗自动反色。`baseOnly` 取无点底图，给扫描动画用。
+    private func makeStatusIcon(baseOnly: Bool = false) -> NSImage {
+        // 优先用 asset catalog 里的矢量模板图，任意缩放都清晰，设计师能直接改。
+        // SentryMenuBar = 完整版；SentryMenuBarBase = 无点版（扫描时三个点由图层画）。
         //
         // 尺寸：SVG 的外框是 22，环只占 19.6/22。按 22pt 画出来环外沿约 19.6pt，
         // 比 23pt 时（外沿 20.5pt）小一点点，仍不超过菜单栏高度。
         let assetSide: CGFloat = 22
-        if let asset = NSImage(named: "SentryMenuBar")?.copy() as? NSImage {
+        let name = baseOnly ? "SentryMenuBarBase" : "SentryMenuBar"
+        if let asset = NSImage(named: name)?.copy() as? NSImage {
             asset.size = NSSize(width: assetSide, height: assetSide)
             asset.isTemplate = true
             return asset
@@ -742,7 +748,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let cy = side / 2
 
             let ringInset: CGFloat = 1.1
-            // 外框是正圆（跟 asset 里的 SVG 一致），扫描涟漪才是同心圆
+            // 外框是正圆（跟 asset 里的 SVG 一致），扫描时三个点沿它同心转
             let frame = NSBezierPath(ovalIn: NSRect(x: ringInset, y: ringInset,
                                                    width: side - ringInset * 2,
                                                    height: side - ringInset * 2))
