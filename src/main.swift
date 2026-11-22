@@ -724,9 +724,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 优先用 asset catalog 里的模板图（Resources/Assets.xcassets/SentryMenuBar.svg）：
         // 矢量、任意缩放都清晰，设计师能直接改。template 渲染，系统按菜单栏明暗自动反色。
         //
-        // 尺寸：SVG 的外框是 22，环只占 19.6/22。按 23pt 画出来环外沿约 20.5pt，
-        // 比 20.5pt 时（外沿 18.3pt）明显大一圈，仍不超过菜单栏高度。
-        let assetSide: CGFloat = 23
+        // 尺寸：SVG 的外框是 22，环只占 19.6/22。按 22pt 画出来环外沿约 19.6pt，
+        // 比 23pt 时（外沿 20.5pt）小一点点，仍不超过菜单栏高度。
+        let assetSide: CGFloat = 22
         if let asset = NSImage(named: "SentryMenuBar")?.copy() as? NSImage {
             asset.size = NSSize(width: assetSide, height: assetSide)
             asset.isTemplate = true
