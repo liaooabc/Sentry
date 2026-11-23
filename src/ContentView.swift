@@ -1928,69 +1928,60 @@ private struct ScanGlassCapsule: ViewModifier {
 }
 
 /// 扫描胶囊状态。ObservableObject：本机 SwiftUI 宏插件不可用，@State 编不过。
-/// 进度自己算一条平滑曲线，但**封顶 90%**：真实检测结束前蓝条绝不到顶，
-/// 这样「进度还没完蓝条先到 100%」的错觉就不会出现。
+/// 关键：**和菜单栏图标用同一个信号 service.checking** —— 菜单转，进度走；
+/// 菜单停，进度补到 100% 显示完成。不再自己写死时长，所以绝不会不同步。
 private final class ScanPhase: ObservableObject {
     @Published var started: Date?
     @Published var finishedAt: Date?
+    /// 菜单停下那一刻的进度，完成动画从这里补到 100%
+    @Published var finishFrom: CGFloat = 0
     @Published var pressed = false
 
-    /// 是否见过 checking=true。点击后磁盘扫描阶段 checking 仍是 false，
-    /// 那一帧绝不能被当成「扫描结束」，否则进度当场清零。
-    private var sawChecking = false
-    private var generation = 0
+    static let doneHold: TimeInterval = 1.0    // 100% 停留多久
+    static let doneAnim: TimeInterval = 0.30   // 补到 100% 的时长
 
-    static let ceiling: CGFloat = 0.90      // 真实完成前的进度上限
-    static let fillDuration: TimeInterval = 4.0   // 0→90% 的时长
-    static let doneHold: TimeInterval = 0.6       // 100% 停留
-    static let timeout: TimeInterval = 10.0       // 兜底，避免永远卡在 90%
-
-    func begin() {
-        generation += 1
-        started = Date()
-        finishedAt = nil
-        sawChecking = false
-        let gen = generation
-        // 兜底：万一真实检测一直不结束，也要收尾，别让用户对着 90% 干等
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.timeout) { [weak self] in
-            guard let self, gen == self.generation, self.finishedAt == nil else { return }
-            self.finish()
+    /// checking 变化：true 开始、false 完成。跟菜单动画完全同一个源。
+    func update(checking now: Bool) {
+        if now, started == nil || finishedAt != nil {
+            // 新一轮开始：清掉上一轮残留
+            started = Date()
+            finishedAt = nil
+            finishFrom = 0
+        } else if !now, let started, finishedAt == nil {
+            // 菜单停了 = 真实检测结束：记下当前进度，接下来补到 100%
+            let elapsed = max(Date().timeIntervalSince(started), 0)
+            finishFrom = 0.92 * CGFloat(1 - exp(-elapsed / 2.2))
+            finishedAt = Date()
+            let gen = self.started
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.doneHold) { [weak self] in
+                guard let self, self.started == gen else { return }
+                self.started = nil
+                self.finishedAt = nil
+                self.finishFrom = 0
+            }
         }
     }
 
-    func checkingChanged(_ now: Bool) {
-        if now {
-            sawChecking = true
-        } else if sawChecking, started != nil, finishedAt == nil {
-            finish()
-        }
-        // now==false 且没见过 true → 点击后的磁盘扫描阶段，忽略
-    }
-
-    private func finish() {
-        finishedAt = Date()
-        let gen = generation
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.doneHold) { [weak self] in
-            guard let self, gen == self.generation else { return }
-            self.started = nil
-            self.finishedAt = nil
-            self.sawChecking = false
-        }
-    }
-
-    /// 纯函数：进度只由起始/完成时间决定，不依赖 checking 的发布时序。
+    /// 纯函数：进度由时间决定。未完成时平滑逼近 92%（不到顶）；
+    /// 完成后从 finishFrom 平滑补到 100%。返回恒定在 0...1，绝不超过 100%。
     func progress(at now: Date) -> CGFloat {
         guard let started = started else { return 0 }
-        let elapsed = max(now.timeIntervalSince(started), 0)
-        if let finishedAt = finishedAt {
-            let t = min(max(now.timeIntervalSince(finishedAt) / 0.35, 0), 1)
-            return Self.ceiling + (1 - Self.ceiling) * CGFloat(easeOut(t))
-        }
-        let x = min(elapsed / Self.fillDuration, 1)
-        return Self.ceiling * CGFloat(easeOut(x))
+        return Self.value(at: now, started: started,
+                          finishedAt: finishedAt, from: finishFrom)
     }
 
-    private func easeOut(_ x: Double) -> Double { 1 - pow(1 - x, 3) }
+    private static func value(at now: Date, started: Date,
+                              finishedAt: Date?, from: CGFloat) -> CGFloat {
+        if let finishedAt {
+            let t = min(max(now.timeIntervalSince(finishedAt) / doneAnim, 0), 1)
+            return min(1, from + (1 - from) * CGFloat(easeOut(t)))
+        }
+        let elapsed = max(now.timeIntervalSince(started), 0)
+        // 指数缓出逼近 92%：扫描再久也慢慢爬，但不到顶，留给完成补最后一段
+        return 0.92 * CGFloat(1 - exp(-elapsed / 2.2))
+    }
+
+    private static func easeOut(_ x: Double) -> Double { 1 - pow(1 - x, 3) }
 }
 
 /// 按下反馈：把 isPressed 写回 phase，让胶囊底色和缩放跟手势一致。
@@ -2002,11 +1993,11 @@ private struct ScanPressStyle: ButtonStyle {
     }
 }
 
-/// 底栏「重新扫描」胶囊 —— 只做最基本的事：
+/// 底栏「重新扫描」胶囊 —— 最基本的进度条，且和菜单栏图标严格同步：
 ///  · 空闲：虚线圆环 + 「重新扫描」，hover 底色变亮、按下底色再亮一点；
-///  · 扫描中：系统蓝从左铺开，百分比数字跟着涨，两者用同一个 p，严格同步；
-///  · 符号始终同一个（circle.dashed），只在被蓝条盖住时由深转白，不旋转不变形；
-///  · 完成：补到 100%，短暂停留后干净回到空闲 —— 不冒出任何新图标。
+///  · 扫描中：checking=true（菜单在转）时蓝条从左平缓铺、数字跟着涨，
+///    两者用同一个 p；符号始终是同一个圆环，被蓝条盖住时由深转白；
+///  · 完成：checking=false（菜单停）立刻补到 100%，短暂停留后回空闲。
 private struct ScanCapsule: View {
     let checking: Bool
     let width: CGFloat
@@ -2018,13 +2009,14 @@ private struct ScanCapsule: View {
 
     var body: some View {
         TimelineView(.animation) { timeline in
-            let p = phase.progress(at: timeline.date)
-            let active = phase.started != nil
+            // 同一个 p 同时喂给蓝条、数字、遮罩，三者永远一致；clamp 防止越界
+            let raw = phase.progress(at: timeline.date)
+            let p = min(max(raw, 0), 1)
             let done = phase.finishedAt != nil
+            let label = done ? "100%" : (p > 0 ? "\(Int(p * 100))%" : "重新扫描")
 
             Button {
-                guard !active else { return }
-                phase.begin()
+                guard !checking else { return }
                 action()
             } label: {
                 ZStack(alignment: .leading) {
@@ -2035,7 +2027,7 @@ private struct ScanCapsule: View {
                         .animation(.easeOut(duration: 0.10), value: hover.on)
                         .animation(.easeOut(duration: 0.08), value: phase.pressed)
 
-                    // 蓝色进度条：宽度 = 数字用的同一个 p，绝不提前到顶
+                    // 蓝条宽度 = 数字用的同一个 p
                     GeometryReader { g in
                         Capsule()
                             .fill(Color.accentColor)
@@ -2043,11 +2035,10 @@ private struct ScanCapsule: View {
                     }
                     .animation(nil, value: p)
 
-                    // 内容画两遍：深色打底，白色用同一块蓝条遮罩。
-                    // 蓝条铺到哪，符号和数字就在哪自然由深转白 —— 视觉与进度永远一致。
-                    capsuleContent(p: p, done: done)
+                    // 内容两遍：深色打底 + 白色用同一块蓝条遮罩，视觉与进度一致
+                    capsuleContent(label: label)
                         .foregroundStyle(Color.primary)
-                    capsuleContent(p: p, done: done)
+                    capsuleContent(label: label)
                         .foregroundStyle(Color.white)
                         .mask(alignment: .leading) {
                             GeometryReader { g in
@@ -2064,17 +2055,18 @@ private struct ScanCapsule: View {
             .contentShape(Capsule())
             .frame(width: width, height: Self.height)
         }
+        .onAppear { phase.update(checking: checking) }
         .onHover { hover.on = $0 }
-        .onChange(of: checking) { phase.checkingChanged($0) }
+        .onChange(of: checking) { phase.update(checking: $0) }
         .modifier(ScanGlassCapsule())
     }
 
     @ViewBuilder
-    private func capsuleContent(p: CGFloat, done: Bool) -> some View {
+    private func capsuleContent(label: String) -> some View {
         HStack(spacing: 5) {
             Image(systemName: "circle.dashed")
                 .font(.system(size: 11, weight: .medium))
-            Text(done ? "100%" : (p > 0 ? "\(Int(p * 100))%" : "重新扫描"))
+            Text(label)
                 .font(.system(size: 12, weight: .medium))
                 .monospacedDigit()
         }
