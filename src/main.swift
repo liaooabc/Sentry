@@ -682,7 +682,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         spin.duration = Self.spinPeriod
         spin.repeatCount = .infinity
         spin.isRemovedOnCompletion = false
-        spin.timingFunction = CAMediaTimingFunction(name: .linear)
+        // 每圈「快起慢收」：一上来就冲出去，接近转满一圈、三点快回到原位时明显减速，
+        // 下一圈再从 0 重新冲。timingFunction 会在每次循环迭代都重新应用，
+        // 所以这个节奏会一圈一圈重复，而不是匀速转。
+        // 控制点 (0.12, 0.72, 0.28, 1)：起步切线很陡（快），末段趋平（慢）。
+        spin.timingFunction = CAMediaTimingFunction(controlPoints: 0.12, 0.72, 0.28, 1.0)
         ring.add(spin, forKey: "spin")
     }
 
