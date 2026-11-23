@@ -1476,34 +1476,20 @@ struct ContentView: View {
 
     private var footer: some View {
         // 右键菜单已经取消，原来的「设置 / 检测更新 / 退出」全搬到底栏：
-        // 左下扫描（带文字），右下三颗玻璃圆：关于、设置、退出。
-        HStack(spacing: 8) {
-            // 扫描放左下（用户指定位置），带文字；宽度取「可更新 / 其他」整条轨道的一半。
-            // 扫描中文字变「扫描中」并显示系统转圈
-            Button {
+        // 左下「重新扫描」（带进度），右下三颗玻璃圆：关于、设置、退出。
+        // 胶囊宽度取「可更新 / 其他」整条轨道（两格 + 轨道左右各 3pt padding），
+        // 和顶栏共用同一个 14pt 左右边距，所以左边缘天然对齐。
+        let trackWidth: CGFloat = {
+            guard let a = ui.tabFrames[0], let b = ui.tabFrames[1] else { return 141 }
+            return b.maxX - a.minX + 6
+        }()
+        return HStack(spacing: 8) {
+            ScanCapsule(checking: service.checking,
+                        width: trackWidth,
+                        hover: ui.scanHover) {
+                guard !service.checking else { return }
                 service.rescan(thenCheck: true, force: true)
-            } label: {
-                HStack(spacing: 5) {
-                    if service.checking {
-                        NativeSpinner().frame(width: 12, height: 12)
-                    } else {
-                        // 空闲用虚线圆环：跟图标同一套「环」语言，一眼能认出是扫描
-                        Image(systemName: "circle.dashed")
-                            .font(.system(size: 11, weight: .medium))
-                    }
-                    Text(service.checking ? "扫描中" : "扫描")
-                        .font(.system(size: 12, weight: .medium))
-                }
-                // 宽度直接等于「可更新」那一格：胶囊由 glassEffect 自绘，
-                // 系统玻璃按钮在窄内容下会强制内缩导致文字被截，只能用自绘那层
-                .frame(width: max(ui.tabFrames[0]?.width ?? 80, 56), height: 26)
-                .modifier(ScanHoverTint(box: ui.scanHover))
-                .modifier(ScanGlassCapsule())
-                .contentShape(Capsule())
             }
-            .buttonStyle(.plain)
-            .onHover { ui.scanHover.on = $0 }
-            .disabled(service.checking)
 
             Spacer()
 
@@ -1938,6 +1924,161 @@ private struct ScanGlassCapsule: ViewModifier {
         } else {
             content.background(Capsule().fill(Color.primary.opacity(0.06)))
         }
+    }
+}
+
+/// 扫描胶囊状态。ObservableObject：本机 SwiftUI 宏插件不可用，@State 编不过。
+/// 进度自己算一条平滑曲线，但**封顶 90%**：真实检测结束前蓝条绝不到顶，
+/// 这样「进度还没完蓝条先到 100%」的错觉就不会出现。
+private final class ScanPhase: ObservableObject {
+    @Published var started: Date?
+    @Published var finishedAt: Date?
+    @Published var pressed = false
+
+    /// 是否见过 checking=true。点击后磁盘扫描阶段 checking 仍是 false，
+    /// 那一帧绝不能被当成「扫描结束」，否则进度当场清零。
+    private var sawChecking = false
+    private var generation = 0
+
+    static let ceiling: CGFloat = 0.90      // 真实完成前的进度上限
+    static let fillDuration: TimeInterval = 4.0   // 0→90% 的时长
+    static let doneHold: TimeInterval = 0.6       // 100% 停留
+    static let timeout: TimeInterval = 10.0       // 兜底，避免永远卡在 90%
+
+    func begin() {
+        generation += 1
+        started = Date()
+        finishedAt = nil
+        sawChecking = false
+        let gen = generation
+        // 兜底：万一真实检测一直不结束，也要收尾，别让用户对着 90% 干等
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.timeout) { [weak self] in
+            guard let self, gen == self.generation, self.finishedAt == nil else { return }
+            self.finish()
+        }
+    }
+
+    func checkingChanged(_ now: Bool) {
+        if now {
+            sawChecking = true
+        } else if sawChecking, started != nil, finishedAt == nil {
+            finish()
+        }
+        // now==false 且没见过 true → 点击后的磁盘扫描阶段，忽略
+    }
+
+    private func finish() {
+        finishedAt = Date()
+        let gen = generation
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.doneHold) { [weak self] in
+            guard let self, gen == self.generation else { return }
+            self.started = nil
+            self.finishedAt = nil
+            self.sawChecking = false
+        }
+    }
+
+    /// 纯函数：进度只由起始/完成时间决定，不依赖 checking 的发布时序。
+    func progress(at now: Date) -> CGFloat {
+        guard let started = started else { return 0 }
+        let elapsed = max(now.timeIntervalSince(started), 0)
+        if let finishedAt = finishedAt {
+            let t = min(max(now.timeIntervalSince(finishedAt) / 0.35, 0), 1)
+            return Self.ceiling + (1 - Self.ceiling) * CGFloat(easeOut(t))
+        }
+        let x = min(elapsed / Self.fillDuration, 1)
+        return Self.ceiling * CGFloat(easeOut(x))
+    }
+
+    private func easeOut(_ x: Double) -> Double { 1 - pow(1 - x, 3) }
+}
+
+/// 按下反馈：把 isPressed 写回 phase，让胶囊底色和缩放跟手势一致。
+private struct ScanPressStyle: ButtonStyle {
+    var phase: ScanPhase
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .onChange(of: configuration.isPressed) { phase.pressed = $0 }
+    }
+}
+
+/// 底栏「重新扫描」胶囊 —— 只做最基本的事：
+///  · 空闲：虚线圆环 + 「重新扫描」，hover 底色变亮、按下底色再亮一点；
+///  · 扫描中：系统蓝从左铺开，百分比数字跟着涨，两者用同一个 p，严格同步；
+///  · 符号始终同一个（circle.dashed），只在被蓝条盖住时由深转白，不旋转不变形；
+///  · 完成：补到 100%，短暂停留后干净回到空闲 —— 不冒出任何新图标。
+private struct ScanCapsule: View {
+    let checking: Bool
+    let width: CGFloat
+    let hover: HoverBox
+    let action: () -> Void
+
+    @ObservedObject private var phase = ScanPhase()
+    private static let height: CGFloat = 26
+
+    var body: some View {
+        TimelineView(.animation) { timeline in
+            let p = phase.progress(at: timeline.date)
+            let active = phase.started != nil
+            let done = phase.finishedAt != nil
+
+            Button {
+                guard !active else { return }
+                phase.begin()
+                action()
+            } label: {
+                ZStack(alignment: .leading) {
+                    // 明确的状态底色：空闲淡、hover 亮、按下更亮
+                    Capsule()
+                        .fill(Color.primary.opacity(
+                            phase.pressed ? 0.18 : (hover.on ? 0.12 : 0.06)))
+                        .animation(.easeOut(duration: 0.10), value: hover.on)
+                        .animation(.easeOut(duration: 0.08), value: phase.pressed)
+
+                    // 蓝色进度条：宽度 = 数字用的同一个 p，绝不提前到顶
+                    GeometryReader { g in
+                        Capsule()
+                            .fill(Color.accentColor)
+                            .frame(width: g.size.width * p, height: g.size.height)
+                    }
+                    .animation(nil, value: p)
+
+                    // 内容画两遍：深色打底，白色用同一块蓝条遮罩。
+                    // 蓝条铺到哪，符号和数字就在哪自然由深转白 —— 视觉与进度永远一致。
+                    capsuleContent(p: p, done: done)
+                        .foregroundStyle(Color.primary)
+                    capsuleContent(p: p, done: done)
+                        .foregroundStyle(Color.white)
+                        .mask(alignment: .leading) {
+                            GeometryReader { g in
+                                Rectangle()
+                                    .frame(width: g.size.width * p, height: g.size.height)
+                            }
+                        }
+                }
+                .frame(width: width, height: Self.height)
+                .scaleEffect(phase.pressed ? 0.97 : 1)
+                .animation(.easeOut(duration: 0.08), value: phase.pressed)
+            }
+            .buttonStyle(ScanPressStyle(phase: phase))
+            .contentShape(Capsule())
+            .frame(width: width, height: Self.height)
+        }
+        .onHover { hover.on = $0 }
+        .onChange(of: checking) { phase.checkingChanged($0) }
+        .modifier(ScanGlassCapsule())
+    }
+
+    @ViewBuilder
+    private func capsuleContent(p: CGFloat, done: Bool) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: "circle.dashed")
+                .font(.system(size: 11, weight: .medium))
+            Text(done ? "100%" : (p > 0 ? "\(Int(p * 100))%" : "重新扫描"))
+                .font(.system(size: 12, weight: .medium))
+                .monospacedDigit()
+        }
+        .frame(width: width, height: Self.height)
     }
 }
 
