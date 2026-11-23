@@ -253,6 +253,16 @@ final class HoverBarView: NSView {
     /// 上一帧行锚点给的高度。高度是会突变的（点开/收起更新说明时行自己长高），
     /// 而 y 走的是弹簧 —— 两者不同步就会拼出一个「旧位置 + 新高度」的方块。
     private var lastHeight: CGFloat = 0
+    /// 上一帧命中的是同一行吗。用来区分「点开说明（同一行在长高）」和
+    /// 「滑到别的行（List 复用会产生一帧旧位置 + 新高度的错位锚点）」。
+    private var lastAnchorKey: String = ""
+    /// 蓝块的高度也走弹簧，跟 y 用同一组参数。
+    /// 不这么做的话：普通行（~40pt）滑到展开说明的行（~86pt），高度那一帧就变成 86，
+    /// 可 y 还留在上一行 —— 方块往上/下冒出去一截，看着就是「预选框跳了一下」。
+    /// y 和高度一起插值，才是整块从一个矩形滑到另一个矩形。
+    private var springH: CGFloat = 0
+    private var velocityH: CGFloat = 0
+    private var springTargetH: CGFloat = 0
     /// 蓝块的横向位置 + 宽度。它俩也跟行内容走，但走的是「硬弹簧」而不是瞬移：
     /// 行被左/右滑开时，锚点会从 14/336 一帧跳到 126/238（滑出按钮的那段被裁掉了），
     /// 直接赋值看着就是「预选框啪地跳一下」；用一根很硬的弹簧滑过去，
@@ -348,11 +358,13 @@ final class HoverBarView: NSView {
         block.alphaValue = 0
         block.isHidden = true
         velocityY = 0
+        velocityH = 0
         velocityX = 0
         velocityW = 0
         lastPoint = nil
         lastTargetY = .nan
         lastHeight = 0
+        lastAnchorKey = ""
         wasScrolling = false
     }
 
@@ -416,9 +428,11 @@ final class HoverBarView: NSView {
         // 横滑例外：那是在滑开行、行本身在横移，冻住就会错位（见 horizontalUntil）
         if shown, now - lastScrollTime < 0.15, now >= horizontalUntil {
             velocityY = 0
+            velocityH = 0
             velocityX = 0
             velocityW = 0
             springTargetY = springY
+            springTargetH = springH
             return
         }
 
@@ -471,12 +485,15 @@ final class HoverBarView: NSView {
             springTargetY = rect.minY
             lastTargetY = rect.minY
             lastHeight = rect.height
+            springH = rect.height
+            velocityH = 0
+            springTargetH = rect.height
             springX = rect.minX
             springW = rect.width
             velocityX = 0
             velocityW = 0
             block.isHidden = false
-            block.frame = CGRect(x: springX, y: springY, width: springW, height: rect.height)
+            block.frame = CGRect(x: springX, y: springY, width: springW, height: springH)
             NSAnimationContext.runAnimationGroup { ctx in
                 ctx.duration = 0.10
                 self.block.animator().alphaValue = 1
@@ -484,16 +501,25 @@ final class HoverBarView: NSView {
             return
         }
 
-        // 行高突变（点开/收起更新说明，一帧到位、没有补间动画）：位置不能还挂在
-        // 弹簧里慢慢追，那会拼出一个「旧位置 + 新高度」的蓝方块。
-        // 判据加上「指针没动」：指针在动说明是换行，那种该走弹簧。
+        // 行高突变分两种，处理方式必须不同：
+        //  1) 点开/收起说明：同一行，y 没动，只是行自己长高/变矮 → y 和高度都原地贴合，
+        //     不贴合的话蓝框会拖着弹簧慢慢追，看着就是「点简介时预选框跳一下」。
+        //  2) 滑到别的行：y 会变，而且 List 复用行宿主时还会给一帧
+        //     「旧位置 + 新高度」的错位锚点 → 绝不 snap y，一律走弹簧，
+        //     不然那一帧的错位置会把蓝框钉到上一行（滑动时往上跳）。
         let heightJump = abs(rect.height - lastHeight) > 1
+        let sameRow = hit.anchorKey == lastAnchorKey
+        let ySteady = lastTargetY.isFinite && abs(rect.minY - lastTargetY) < 6
         lastHeight = rect.height
-        if heightJump, !pointerMoved {
+        lastAnchorKey = hit.anchorKey
+        if heightJump, sameRow, ySteady {
             springY = rect.minY
             velocityY = 0
             springTargetY = rect.minY
             lastTargetY = rect.minY
+            springH = rect.height
+            velocityH = 0
+            springTargetH = rect.height
             wasScrolling = false
         }
 
@@ -512,11 +538,22 @@ final class HoverBarView: NSView {
                 springY = springTargetY
                 velocityY = 0
             }
+            // 高度跟着 y 用同一根弹簧：滑进/滑出展开行时整块一起长/缩，
+            // 不再出现「y 还在上一行、高度已经是新行的」那种往上冒的方块
+            springTargetH = rect.height
+            velocityH += (omega * omega * (springTargetH - springH) - 2 * zeta * omega * velocityH) * dt
+            springH += velocityH * dt
+            if abs(springTargetH - springH) < 0.2, abs(velocityH) < 4 {
+                springH = springTargetH
+                velocityH = 0
+            }
         } else if scrolling {
             // 正在滚（含惯性）：原地冻住。跟着行跑必然要在换行时跳一整行，滚得越快跳得越密
             wasScrolling = true
             velocityY = 0
             springTargetY = springY
+            velocityH = 0
+            springTargetH = springH
         } else {
             if wasScrolling {
                 wasScrolling = false
@@ -524,6 +561,7 @@ final class HoverBarView: NSView {
                 quickUntil = now + 0.4
             }
             springTargetY = rect.minY
+            springTargetH = rect.height
             if now < quickUntil {
                 approach(dt: dt)
             } else {
@@ -535,11 +573,17 @@ final class HoverBarView: NSView {
                     springY = springTargetY
                     velocityY = 0
                 }
+                velocityH += (omega * omega * (springTargetH - springH) - 2 * zeta * omega * velocityH) * dt
+                springH += velocityH * dt
+                if abs(springTargetH - springH) < 0.2, abs(velocityH) < 4 {
+                    springH = springTargetH
+                    velocityH = 0
+                }
             }
         }
         advanceHorizontal(dt: dt, targetX: rect.minX, targetW: rect.width,
                           direct: now < horizontalUntil)
-        block.frame = CGRect(x: springX, y: springY, width: springW, height: rect.height)
+        block.frame = CGRect(x: springX, y: springY, width: springW, height: springH)
 
         // 调试：`defaults write com.hushixiong.sentry UR_DEBUG_HOVER -bool YES` 后
         // 每帧把「锚点要的矩形 / 蓝块实际摆的矩形」追加到 /tmp/hoverbar.log。
@@ -649,6 +693,9 @@ final class HoverBarView: NSView {
         springY += (springTargetY - springY) * k
         velocityY = 0
         if abs(springTargetY - springY) < 0.4 { springY = springTargetY }
+        springH += (springTargetH - springH) * k
+        velocityH = 0
+        if abs(springTargetH - springH) < 0.4 { springH = springTargetH }
     }
 
     private func setHovered(_ view: RowAnchorView) {
@@ -667,8 +714,10 @@ final class HoverBarView: NSView {
     private func dismiss() {
         clearHover()
         velocityY = 0
+        velocityH = 0
         lastTargetY = .nan
         lastHeight = 0
+        lastAnchorKey = ""
         velocityX = 0
         velocityW = 0
         missingSince = 0
