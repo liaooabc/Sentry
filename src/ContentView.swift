@@ -2004,7 +2004,11 @@ private struct ScanCapsule: View {
     let hover: HoverBox
     let action: () -> Void
 
-    @ObservedObject private var phase = ScanPhase()
+    // 必须是 @StateObject：用 @ObservedObject + 默认初始值的话，ContentView.body 每次
+    // 因 results/progress/rows 变化重算时，这个子视图会被重建、phase 被换成 started=nil
+    // 的新实例，进度条当场清零 —— 表现为「点了扫描却完全没有进度」。@StateObject 由
+    // SwiftUI 稳定持有同一个实例，跨重建保住 started / finishedAt。
+    @StateObject private var phase = ScanPhase()
     private static let height: CGFloat = 26
 
     var body: some View {
