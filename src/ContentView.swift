@@ -900,6 +900,19 @@ struct ContentView: View {
         // 改成 overlay 后栏只占自己的高度、不挤列表；首行靠 List 里的顶部留白让位，
         // 一滚起来留白跟着走，行就从毛玻璃背后穿过、被背板糊掉、渐隐进栏里。
         list
+            // 先把边缘虚化铺在列表上、再让按钮落在它上面：越靠面板顶/底，穿过去的
+            // 行被糊得越实，往里走逐渐恢复清晰。只靠 ScrollEdgeBlur 时渐变贴着列表
+            // 真正的上下边界（被栏盖住），看着就是内容很清楚地从按钮背后穿过去。
+            .overlay(alignment: .top) {
+                EdgeBlurStrip(edge: .top)
+                    .frame(height: Self.topInset + 14)
+                    .allowsHitTesting(false)
+            }
+            .overlay(alignment: .bottom) {
+                EdgeBlurStrip(edge: .bottom)
+                    .frame(height: Self.bottomInset + 12)
+                    .allowsHitTesting(false)
+            }
             .overlay(alignment: .top) { topBar }
             .overlay(alignment: .bottom) { footer }
     }
@@ -1890,9 +1903,9 @@ extension View {
 
 // MARK: - 玻璃
 
-/// 列表的滚动边缘效果（macOS 26 的液态玻璃）：内容滑到被顶部条 / 底栏遮住的那一段时，
-/// 由系统做一层渐进模糊 + 淡出，不是我们自己画渐变，所以深浅色和透明度都跟系统一致。
-/// 老系统没有这个 API，就什么都不加——那时靠条自己的 ultraThinMaterial 兜住。
+/// 列表的滚动边缘效果（macOS 26 的液态玻璃）：内容滑到面板最上 / 最下那一段时，
+/// 由系统再做一层渐进模糊 + 淡出。它贴着 ScrollView 自己的边界生效，而顶栏/底栏
+/// 现在是浮在列表上的，所以单靠它看不出「从按钮背后越走越糊」——那部分由 EdgeBlurStrip 补。
 private struct ScrollEdgeBlur: ViewModifier {
     func body(content: Content) -> some View {
         if #available(macOS 26.0, *) {
@@ -1901,6 +1914,35 @@ private struct ScrollEdgeBlur: ViewModifier {
         } else {
             content
         }
+    }
+}
+
+/// 顶栏 / 底栏背后的边缘虚化：一层系统材质，用垂直渐变把强度从边缘往里递减。
+/// 这样行从按钮背后穿过时不是「清楚地贴过去」，而是越靠近面板顶/底越糊、往里逐渐清晰。
+/// 只放在列表和按钮之间，不盖按钮本身，所以控件始终是清楚的。
+private struct EdgeBlurStrip: View {
+    let edge: Edge
+
+    var body: some View {
+        let strong = edge == .top ? UnitPoint.top : UnitPoint.bottom
+        let weak = edge == .top ? UnitPoint.bottom : UnitPoint.top
+        Rectangle()
+            // .regular 还挡不住从玻璃按钮里透出来的字，换成更实的一档；
+            // 渐变把不透明度压住，免得整条变成实心色块。
+            .fill(.thickMaterial)
+            .mask(
+                LinearGradient(
+                    stops: [
+                        .init(color: .black.opacity(0.92), location: 0),
+                        .init(color: .black.opacity(0.72), location: 0.4),
+                        .init(color: .black.opacity(0.2), location: 0.72),
+                        .init(color: .black.opacity(0), location: 1)
+                    ],
+                    startPoint: strong,
+                    endPoint: weak
+                )
+            )
+            .allowsHitTesting(false)
     }
 }
 
