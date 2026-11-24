@@ -894,9 +894,14 @@ struct ContentView: View {
     }
 
     private var listPage: some View {
+        // 顶栏/底栏改成悬浮覆盖在列表上：列表铺满整个面板，内容能从两栏背后滚过去。
+        // 以前用 safeAreaInset 把列表挤在两栏之间，每页的 PageClipView 又裁在栏底，
+        // 滚上来的行被直接切平（半截图标就贴在栏下），系统边缘渐隐根本没机会生效。
+        // 改成 overlay 后栏只占自己的高度、不挤列表；首行靠 List 里的顶部留白让位，
+        // 一滚起来留白跟着走，行就从毛玻璃背后穿过、被背板糊掉、渐隐进栏里。
         list
-            .safeAreaInset(edge: .top, spacing: 0) { topBar }
-            .safeAreaInset(edge: .bottom, spacing: 0) { footer }
+            .overlay(alignment: .top) { topBar }
+            .overlay(alignment: .bottom) { footer }
     }
 
     // MARK: - 设置页
@@ -1135,6 +1140,11 @@ struct ContentView: View {
     private static let barControlHeight: CGFloat = 26      // 分段轨道、按钮和搜索框的统一高度
     /// 顶栏右侧两颗按钮各占一半：(94 - 5) / 2。94 = 底栏三颗圆钮那一排的宽度（26×3 + 8×2）
     private static let halfControlWidth: CGFloat = (barControlHeight * 3 + 16 - 5) / 2
+    /// 顶/底栏悬浮占位高度：顶栏 = padding 12 + 控件 26 + padding 8；底栏 = 8 + 26 + 8。
+    /// 列表铺满面板后，用这两个值给 List 内容垫首末留白：静止时首行不压在栏下，
+    /// 滚动时留白跟着内容一起走，行就能从毛玻璃栏背后穿过去。
+    static let topInset: CGFloat = 46
+    static let bottomInset: CGFloat = 42
 
     private var tabBar: some View {
         HStack(spacing: 8) {
@@ -1609,7 +1619,9 @@ private struct ListPage: View {
                 HoverBarOverlay(page: index)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 List {
-                Color.clear.frame(height: 0).id("top")
+                // 顶部留白 = 顶栏高度：静止时首行落在栏下方，不被悬浮栏压住；
+                // 一起滚动时这块留白滑走，后面的行就从顶栏毛玻璃背后穿过、被渐隐。
+                Color.clear.frame(height: ContentView.topInset).id("top")
                     .listChrome()
 
                 if index == 0 {
@@ -1632,6 +1644,9 @@ private struct ListPage: View {
                         }
                     }
                 }
+                // 底部留白 = 底栏高度：最后一行能滚到悬浮底栏上方，不被压住
+                Color.clear.frame(height: ContentView.bottomInset)
+                    .listChrome()
             }
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
