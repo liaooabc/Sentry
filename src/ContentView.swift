@@ -1949,8 +1949,8 @@ private final class ScanPhase: ObservableObject {
             finishFrom = 0
         } else if !now, let started, finishedAt == nil {
             // 菜单停了 = 真实检测结束：记下当前进度，接下来补到 100%
-            let elapsed = max(Date().timeIntervalSince(started), 0)
-            finishFrom = 0.92 * CGFloat(1 - exp(-elapsed / 2.2))
+            // 用和 progress() 同一个公式，别让完成瞬间进度跳一下
+            finishFrom = Self.running(elapsed: max(Date().timeIntervalSince(started), 0))
             finishedAt = Date()
             let gen = self.started
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.doneHold) { [weak self] in
@@ -1962,7 +1962,7 @@ private final class ScanPhase: ObservableObject {
         }
     }
 
-    /// 纯函数：进度由时间决定。未完成时平滑逼近 92%（不到顶）；
+    /// 纯函数：进度由时间决定。未完成时平缓爬到 90%（不到顶）；
     /// 完成后从 finishFrom 平滑补到 100%。返回恒定在 0...1，绝不超过 100%。
     func progress(at now: Date) -> CGFloat {
         guard let started = started else { return 0 }
@@ -1976,9 +1976,15 @@ private final class ScanPhase: ObservableObject {
             let t = min(max(now.timeIntervalSince(finishedAt) / doneAnim, 0), 1)
             return min(1, from + (1 - from) * CGFloat(easeOut(t)))
         }
-        let elapsed = max(now.timeIntervalSince(started), 0)
-        // 指数缓出逼近 92%：扫描再久也慢慢爬，但不到顶，留给完成补最后一段
-        return 0.92 * CGFloat(1 - exp(-elapsed / 2.2))
+        return Self.running(elapsed: max(now.timeIntervalSince(started), 0))
+    }
+
+    /// 扫描中那段：线性、6 秒爬到 90%。真实全量检测 5~7 秒（菜单栏图标
+    /// 转 5~6 圈），进度条跟着这个节奏匀速走，观感才不会「扫一下就完了」。
+    /// 别用 1-exp(-t/2.2) 或 easeOut(t/4) —— 前两秒就冲到七八成，看着太快。
+    /// 完成态的起点也走这里，保证 checking 归零那一刻进度不跳变。
+    private static func running(elapsed: TimeInterval) -> CGFloat {
+        return 0.90 * CGFloat(min(elapsed / 6.0, 1))
     }
 
     private static func easeOut(_ x: Double) -> Double { 1 - pow(1 - x, 3) }
@@ -2031,13 +2037,21 @@ private struct ScanCapsule: View {
                         .animation(.easeOut(duration: 0.10), value: hover.on)
                         .animation(.easeOut(duration: 0.08), value: phase.pressed)
 
-                    // 蓝条宽度 = 数字用的同一个 p
-                    GeometryReader { g in
-                        Capsule()
-                            .fill(Color.accentColor)
-                            .frame(width: g.size.width * p, height: g.size.height)
-                    }
-                    .animation(nil, value: p)
+                    // 蓝条：画一条和按钮完全同尺寸的整条胶囊，再用左对齐的矩形
+                    // 遮罩裁出左边 p 那一段。绝不「画一条宽度=p 的胶囊」——那样
+                    // p 很小时宽度小于高度，胶囊会缩成一个圆顶出上下边框，右端
+                    // 也跟着变圆，看起来就是蓝块超出按钮边框。整条胶囊 + 裁剪后，
+                    // 右端始终是圆头、上下永远贴着按钮边，低百分比也不会冒出去。
+                    Capsule()
+                        .fill(Color.accentColor)
+                        .frame(width: width, height: Self.height)
+                        .mask(alignment: .leading) {
+                            GeometryReader { g in
+                                Rectangle()
+                                    .frame(width: g.size.width * p, height: g.size.height)
+                            }
+                        }
+                        .animation(nil, value: p)
 
                     // 内容两遍：深色打底 + 白色用同一块蓝条遮罩，视觉与进度一致
                     capsuleContent(label: label)
