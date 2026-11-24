@@ -8,6 +8,10 @@ final class UpdateService: ObservableObject {
     @Published private(set) var rows: [AppRow] = []
     @Published private(set) var updateCount: Int = 0
     @Published private(set) var checking: Bool = false
+    /// 只有「用户主动点重新扫描」才置起：菜单栏动画和底栏进度条只认这个信号。
+    /// 后台静默检测（定时/网络恢复/唤醒/目录变化/启动首扫）只更新数据，不动动画，
+    /// 否则用户没点扫描，打开面板却看到进度条自己在走。
+    @Published private(set) var userScanning: Bool = false
     @Published private(set) var progress: Double = 0
     @Published private(set) var lastCheck: Date?
     @Published var settings = AppSettings()
@@ -36,6 +40,9 @@ final class UpdateService: ObservableObject {
     /// 等它收尾补上 —— 否则 checkAll 开头的 guard !checking 会静默吞掉这次重查，
     /// 界面就停在「开关已关、却还报着 beta」（那一轮用的是切换前捕获的 allowBeta）。
     private var pendingBetaRecheck: Set<String>?
+    /// 用户点了「重新扫描」但当时正忙（后台检测/磁盘扫描在跑），先记账，
+    /// 等那一轮结束立刻补跑一次全量。绝不静默丢掉用户的点击 —— 那是「点了没反应/卡住」。
+    private var pendingUserScan = false
 
     // 真正的实现在 Models.swift 的 SentrySupportDir：Cask 枚举在并发 Task 里也要用它
     static let supportDir: URL = SentrySupportDir
@@ -57,12 +64,39 @@ final class UpdateService: ObservableObject {
         startEnvironmentTriggers()
     }
 
+    /// 用户点「重新扫描」的唯一入口：当前忙（磁盘扫描/后台检测在跑）就记账排队，
+    /// 等那一轮收尾立刻补跑，绝不静默吞掉 —— 吞掉就是「点了没反应/卡住」。
+    func requestUserScan() {
+        guard !userScanning else { return }   // 用户这一轮正在进行，忽略连点
+        // 立即置起动画：点了马上有反馈。若当前忙（后台检测/磁盘扫描在跑），
+        // 这轮动画会一直走到补跑的那轮真正结束，中间不留「点了没反应」的空窗。
+        userScanning = true
+        if scanning || checking {
+            pendingUserScan = true
+            return
+        }
+        startUserScan()
+    }
+
+    private func startUserScan() {
+        userScanning = true
+        rescan(thenCheck: true, force: true, byUser: true)
+    }
+
+    /// 忙的那轮结束后，把欠着的用户扫描补上。所有「系统空闲」的出口都调它。
+    private func drainPendingUserScan() {
+        guard pendingUserScan, !scanning, !checking else { return }
+        pendingUserScan = false
+        startUserScan()
+    }
+
     /// 扫描放到后台队列：遍历 /Applications、逐个读 Info.plist 是磁盘密集操作，
     /// 挂在主线程上会让面板在扫大目录时明显卡一下。
     /// - Parameters:
     ///   - thenCheck: 扫完是否接着检测一轮
     ///   - force: 检测时是否忽略新鲜度（用户手动点「扫描」时用 true）
-    func rescan(thenCheck: Bool = false, force: Bool = false) {
+    ///   - byUser: 是否由用户主动触发。只有它置起 userScanning，驱动动画
+    func rescan(thenCheck: Bool = false, force: Bool = false, byUser: Bool = false) {
         guard !scanning else { return }
         scanning = true
         Task { [weak self] in
@@ -83,10 +117,13 @@ final class UpdateService: ObservableObject {
             }
             self.appCount = self.apps.count
             self.rebuild()
-            guard thenCheck else { return }
+            guard thenCheck else {
+                self.drainPendingUserScan()
+                return
+            }
             if force {
-                // 用户点「扫描」：全量重查
-                self.checkAll(force: true)
+                // 用户点「扫描」：全量重查。byUser 让动画只跟随这一次
+                self.checkAll(force: true, byUser: byUser)
             } else if previousById.isEmpty {
                 // 启动首次扫描：按 TTL 补过期的，保留磁盘里还新鲜的结果
                 self.checkAll(force: false)
@@ -173,11 +210,16 @@ final class UpdateService: ObservableObject {
     /// force = true（用户点「检查更新」或刷新按钮）：全部重查
     /// - Parameter only: 只查这几个 bundle id（切换「接收测试版」时只重查会受影响的那几个，
     ///   不用把 136 个 App 全跑一遍）
-    func checkAll(force: Bool = false, only: Set<String>? = nil) {
-        guard !checking else { return }
+    /// - Parameter byUser: 用户主动触发。只有它驱动菜单栏/底栏的扫描动画
+    func checkAll(force: Bool = false, only: Set<String>? = nil, byUser: Bool = false) {
+        guard !checking else {
+            // 用户这一轮撞上正在跑的后台检测：记账，等它收尾补跑，不静默丢
+            if byUser { pendingUserScan = true }
+            return
+        }
         // 还没扫到 App：先扫，扫完自动接着查这一轮，别在这里空转
         guard !apps.isEmpty else {
-            rescan(thenCheck: true, force: force)
+            rescan(thenCheck: true, force: force, byUser: byUser)
             return
         }
 
@@ -202,7 +244,12 @@ final class UpdateService: ObservableObject {
                 return r.checkedAt < cutoff
             }
             .sorted { priority($0) > priority($1) }
-        guard !targets.isEmpty else { return }
+        guard !targets.isEmpty else {
+            // 没有要查的（例如全被忽略）：这一轮实际上没跑，别让 userScanning 卡在 true
+            if byUser { userScanning = false }
+            drainPendingUserScan()
+            return
+        }
 
         checking = true
         progress = 0
@@ -242,12 +289,17 @@ final class UpdateService: ObservableObject {
             self.lastCheck = self.settings.lastCheck
             self.checking = false
             self.progress = 1
+            // 用户这一轮结束：动画信号归零（菜单停、进度条补到 100%）。
+            // 后台轮 byUser=false，不动 userScanning。
+            if byUser { self.userScanning = false }
             self.save()
             self.notifyIfNeeded()
             self.retryFailedIfNeeded()
             // 检测期间用户切过「接收测试版」的话，那次重查被 guard !checking 挡掉了，
             // 现在这轮结束、checking 已归零，补跑它。否则 beta 会一直挂在列表上。
             self.flushPendingBetaRecheck()
+            // 用户点扫描时若正忙，攒在这里了；现在空闲，补跑。
+            self.drainPendingUserScan()
             if ProcessInfo.processInfo.environment["UR_DEBUG"] != nil {
                 let ms = Int(Date().timeIntervalSince(started) * 1000)
                 FileHandle.standardError.write("[UR] 本轮查了 \(targets.count) 个 App，用时 \(ms) ms\n".data(using: .utf8)!)

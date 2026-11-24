@@ -142,12 +142,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // 扫描时菜单栏图标的三个点沿环转，扫完停回原样
-        bobCancellable = service.$checking
+        // 只有用户主动点「重新扫描」才转菜单图标 —— 后台静默检测
+        // （定时/网络恢复/唤醒/首扫）不转，否则用户没扫图标却自己在动。
+        bobCancellable = service.$userScanning
             .receive(on: RunLoop.main)
-            .sink { [weak self] checking in
+            .sink { [weak self] scanning in
                 Task { @MainActor in
-                    if checking { self?.startScanAnimation() } else { self?.stopScanAnimation() }
+                    if scanning { self?.startScanAnimation() } else { self?.stopScanAnimation() }
                 }
             }
 
@@ -352,7 +353,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func rescanFromMenu() { service.rescan() }
+    @objc private func rescanFromMenu() { service.requestUserScan() }
 
     private func showPanel() {
         guard let panel, !panel.isVisible else { return }

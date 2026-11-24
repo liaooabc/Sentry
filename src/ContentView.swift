@@ -1484,11 +1484,11 @@ struct ContentView: View {
             return b.maxX - a.minX + 6
         }()
         return HStack(spacing: 8) {
-            ScanCapsule(checking: service.checking,
+            // 进度条只跟随「用户主动扫描」：后台静默检测不动它，避免没点却在走。
+            ScanCapsule(checking: service.userScanning,
                         width: trackWidth,
                         hover: ui.scanHover) {
-                guard !service.checking else { return }
-                service.rescan(thenCheck: true, force: true)
+                service.requestUserScan()
             }
 
             Spacer()
@@ -1928,8 +1928,8 @@ private struct ScanGlassCapsule: ViewModifier {
 }
 
 /// 扫描胶囊状态。ObservableObject：本机 SwiftUI 宏插件不可用，@State 编不过。
-/// 关键：**和菜单栏图标用同一个信号 service.checking** —— 菜单转，进度走；
-/// 菜单停，进度补到 100% 显示完成。不再自己写死时长，所以绝不会不同步。
+/// 关键：**和菜单栏图标用同一个信号 service.userScanning** —— 只有用户主动扫描
+/// 才转菜单、走进度；菜单停，进度补到 100% 显示完成。后台静默检测不触发动画。
 private final class ScanPhase: ObservableObject {
     @Published var started: Date?
     @Published var finishedAt: Date?
@@ -1979,12 +1979,15 @@ private final class ScanPhase: ObservableObject {
         return Self.running(elapsed: max(now.timeIntervalSince(started), 0))
     }
 
-    /// 扫描中那段：线性、6 秒爬到 90%。真实全量检测 5~7 秒（菜单栏图标
+    /// 扫描中那段：线性 6 秒爬到 90%。真实全量检测 5~7 秒（菜单栏图标
     /// 转 5~6 圈），进度条跟着这个节奏匀速走，观感才不会「扫一下就完了」。
     /// 别用 1-exp(-t/2.2) 或 easeOut(t/4) —— 前两秒就冲到七八成，看着太快。
-    /// 完成态的起点也走这里，保证 checking 归零那一刻进度不跳变。
+    /// 6 秒后不再硬停在 90%：个别慢源会把一轮拖到 20 秒以上，封顶就视觉卡死，
+    /// 所以后期继续缓慢渐近逼近 99%（留最后一段给完成动画），既不卡住也不越界。
+    /// 完成态的起点也走这里，保证信号归零那一刻进度不跳变。
     private static func running(elapsed: TimeInterval) -> CGFloat {
-        return 0.90 * CGFloat(min(elapsed / 6.0, 1))
+        if elapsed <= 6 { return 0.90 * CGFloat(elapsed / 6.0) }
+        return CGFloat(0.90 + 0.09 * (1 - exp(-(elapsed - 6) / 8.0)))
     }
 
     private static func easeOut(_ x: Double) -> Double { 1 - pow(1 - x, 3) }
