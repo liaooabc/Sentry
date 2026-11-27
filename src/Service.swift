@@ -71,6 +71,9 @@ final class UpdateService: ObservableObject {
         // 立即置起动画：点了马上有反馈。若当前忙（后台检测/磁盘扫描在跑），
         // 这轮动画会一直走到补跑的那轮真正结束，中间不留「点了没反应」的空窗。
         userScanning = true
+        // 进度条此刻就会开始走：先把上一轮的残留进度清掉，否则一点击
+        // 就跳到旧百分比（真实进度要等检测真正开始才会重新赋值）。
+        progress = 0
         if scanning || checking {
             pendingUserScan = true
             return
@@ -254,7 +257,6 @@ final class UpdateService: ObservableObject {
         checking = true
         progress = 0
         let total = Double(targets.count)
-        let started = Date()
 
         Task { [weak self] in
             guard let self else { return }
@@ -300,10 +302,6 @@ final class UpdateService: ObservableObject {
             self.flushPendingBetaRecheck()
             // 用户点扫描时若正忙，攒在这里了；现在空闲，补跑。
             self.drainPendingUserScan()
-            if ProcessInfo.processInfo.environment["UR_DEBUG"] != nil {
-                let ms = Int(Date().timeIntervalSince(started) * 1000)
-                FileHandle.standardError.write("[UR] 本轮查了 \(targets.count) 个 App，用时 \(ms) ms\n".data(using: .utf8)!)
-            }
         }
     }
 
@@ -511,10 +509,6 @@ final class UpdateService: ObservableObject {
             if r.suppressedBeta == true { return row.id }
             return nil
         })
-        if ProcessInfo.processInfo.environment["UR_DEBUG"] != nil {
-            let line = "[UR] 接收测试版 → \(on ? "开" : "关")，受影响 \(affected.count) 个：\(affected.sorted().joined(separator: ", "))\n"
-            FileHandle.standardError.write(line.data(using: .utf8)!)
-        }
         guard !affected.isEmpty else { return }
         // 撞上正在跑的一轮就先记账，等它收尾补查。直接调 checkAll 会被
         // 开头的 guard !checking 静默吞掉，开关就「关了个寂寞」。
@@ -627,10 +621,6 @@ final class UpdateService: ObservableObject {
     /// 左键点一行：去软件自己的官网（不下载、不跳商店产品页）
     func openSite(for row: AppRow) {
         let site = row.result?.homepage ?? row.result?.downloadURL
-        if ProcessInfo.processInfo.environment["UR_DEBUG"] != nil {
-            let line = "[UR] 左键打开：\(row.app.name) → \(site ?? "（无，改为在 Finder 中显示）")\n"
-            FileHandle.standardError.write(line.data(using: .utf8)!)
-        }
         if let s = site, let url = URL(string: s) {
             NSWorkspace.shared.open(url)
         } else {

@@ -13,6 +13,11 @@ extension Notification.Name {
 
     /// 点更新通知后传过来的 App id：列表翻到「可更新」并定位到那一行。
     static let urRevealRow = Notification.Name("URRevealRow")
+
+    /// 扫描收尾开始/结束：菜单栏呼吸必须跟着进度条一起走完，
+    /// 不能检测一结束就停——进度条还要匀速补满、停留、淡出好几秒。
+    static let sentryScanTailBegin = Notification.Name("SentryScanTailBegin")
+    static let sentryScanTailEnd = Notification.Name("SentryScanTailEnd")
 }
 
 /// 顶栏/分段控件/设置页这些「界面壳」的状态。
@@ -235,6 +240,11 @@ final class HoverBarView: NSView {
     private let page: Int
     private var timer: Timer?
     private var scrollMonitor: Any?
+    /// 菜单（排序下拉 / 行右键）正在跟踪时，底层列表必须停手：
+    /// 菜单是独立窗口，指针在菜单项上下移动时，坐标换算回来仍落在列表行上，
+    /// 不挂起的话蓝条会跟着鼠标在底层乱跑（视频里那个 bug）。
+    private var menuTracking = false
+    private var menuObservers: [NSObjectProtocol] = []
     /// 正在显示（淡入淡出分别由 alphaValue 负责）
     private var shown = false
     /// 竖直方向的弹簧：位置 + 速度
@@ -383,6 +393,28 @@ final class HoverBarView: NSView {
             self?.noteScroll(event)
             return event
         }
+
+        // 菜单（排序下拉、行右键）跟踪期间挂起跟随：菜单是独立窗口，
+        // 指针在菜单项上下移动时坐标仍落在列表行上，不挂起蓝条就跟着在底层乱跑。
+        // 系统菜单和 SwiftUI Menu 都会发这两个通知，进程内 NotificationCenter 即可。
+        menuObservers = [
+            NotificationCenter.default.addObserver(
+                forName: NSMenu.didBeginTrackingNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                guard let self else { return }
+                self.menuTracking = true
+                self.dismiss()   // 收起蓝条、熄掉文字高亮，菜单期间底层保持干净
+            },
+            NotificationCenter.default.addObserver(
+                forName: NSMenu.didEndTrackingNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                guard let self else { return }
+                self.menuTracking = false
+                // 指针可能已经不在菜单打开前那一行了：清掉上一帧位置，
+                // 让下一帧按新位置重新贴合，而不是把旧坐标当基准慢慢滑过去
+                self.lastPoint = nil
+            }
+        ]
     }
 
     private func stopTimer() {
@@ -392,6 +424,11 @@ final class HoverBarView: NSView {
             NSEvent.removeMonitor(scrollMonitor)
             self.scrollMonitor = nil
         }
+        for observer in menuObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        menuObservers.removeAll()
+        menuTracking = false
     }
 
     private func noteScroll(_ event: NSEvent) {
@@ -417,8 +454,10 @@ final class HoverBarView: NSView {
             suspend()
             return
         }
+        // 菜单跟踪期间完全停手：蓝条已在 didBeginTracking 时收起，
+        // 这里不再读鼠标、不再找行、不再点亮文字，底层列表保持静止。
+        guard !menuTracking else { return }
         let now = ProcessInfo.processInfo.systemUptime
-        if HoverBarView.fpsDebug, page == 0 { noteFrameGap(now) }
         // dt 卡上限：偶尔卡一帧也不会让弹簧冲出去
         let dt = min(max(now - lastFrameTime, 1.0 / 240.0), 0.05)
         lastFrameTime = now
@@ -584,20 +623,6 @@ final class HoverBarView: NSView {
         advanceHorizontal(dt: dt, targetX: rect.minX, targetW: rect.width,
                           direct: now < horizontalUntil)
         block.frame = CGRect(x: springX, y: springY, width: springW, height: springH)
-
-        // 调试：`defaults write com.hushixiong.sentry UR_DEBUG_HOVER -bool YES` 后
-        // 每帧把「锚点要的矩形 / 蓝块实际摆的矩形」追加到 /tmp/hoverbar.log。
-        // 排查「展开说明时蓝块跳一下、还多出方框」这类几何问题，看日志比看录屏准。
-        if UserDefaults.standard.bool(forKey: "UR_DEBUG_HOVER") {
-            let line = String(format: "t=%.3f key=%@ rect=(x%.1f w%.1f y%.1f h%.1f) spring=(x%.1f w%.1f) sy=%.1f block=(x%.1f w%.1f y%.1f h%.1f) jump=%d mov=%d hsw=%d\n",
-                              now, hit.anchorKey, rect.minX, rect.width, rect.minY, rect.height,
-                              springX, springW, springY,
-                              block.frame.minX, block.frame.width,
-                              block.frame.minY, block.frame.height,
-                              heightJump ? 1 : 0, pointerMoved ? 1 : 0,
-                              now < horizontalUntil ? 1 : 0)
-            HoverBarView.appendDebug(line)
-        }
     }
 
     /// 横向跟随：连续横滑时直接跟（拖拽不能有滞后），其余时候走一根很硬的弹簧。
@@ -633,56 +658,6 @@ final class HoverBarView: NSView {
         if abs(targetW - springW) < 0.2, abs(velocityW) < 2 {
             springW = targetW
             velocityW = 0
-        }
-    }
-
-    /// 调试文本先攒在内存里，退出时一次性落盘。
-    /// 每 0.5s 开一次文件写一行本身就会在主线程上抖一下，
-    /// 会污染「滚动掉帧」的测量结果。
-    static var debugBuffer: [String] = []
-
-    static func flushDebug() {
-        guard !debugBuffer.isEmpty else { return }
-        let text = debugBuffer.joined()
-        debugBuffer.removeAll()
-        try? text.data(using: .utf8)?.write(to: URL(fileURLWithPath: "/tmp/hoverbar.log"))
-    }
-
-    private static func appendDebug(_ line: String) {
-        debugBuffer.append(line)
-    }
-
-    // MARK: - 掉帧采样（仅 UR_DEBUG_FPS=1 时）
-
-    static let fpsDebug = ProcessInfo.processInfo.environment["UR_DEBUG_FPS"] == "1"
-    private var fpsPrev: TimeInterval = 0
-    private var fpsWindowStart: TimeInterval = 0
-    private var fpsCount = 0
-    private var fpsSum = 0.0
-    private var fpsMax = 0.0
-    private var fpsDrops = 0
-
-    /// 60Hz 的 Timer 本身就会被主线程的活拖慢，所以「相邻两次 tick 的间隔」
-    /// 正好就是主线程的卡顿：>20ms 记一次掉帧（60fps 的预算 16.7ms）。
-    private func noteFrameGap(_ now: TimeInterval) {
-        defer { fpsPrev = now }
-        guard fpsPrev > 0 else { fpsWindowStart = now; return }
-        let gap = now - fpsPrev
-        if fpsWindowStart == 0 { fpsWindowStart = now }
-        fpsCount += 1
-        fpsSum += gap
-        fpsMax = max(fpsMax, gap)
-        if gap > 0.020 { fpsDrops += 1 }
-        if now - fpsWindowStart >= 0.5 {
-            let line = String(format: "frames=%d avg=%.1fms max=%.1fms drops=%d\n",
-                              fpsCount, fpsSum / Double(max(fpsCount, 1)) * 1000,
-                              fpsMax * 1000, fpsDrops)
-            HoverBarView.appendDebug(line)
-            fpsWindowStart = now
-            fpsCount = 0
-            fpsSum = 0
-            fpsMax = 0
-            fpsDrops = 0
         }
     }
 
@@ -1509,6 +1484,7 @@ struct ContentView: View {
         return HStack(spacing: 8) {
             // 进度条只跟随「用户主动扫描」：后台静默检测不动它，避免没点却在走。
             ScanCapsule(checking: service.userScanning,
+                        real: CGFloat(service.progress),
                         width: trackWidth,
                         hover: ui.scanHover) {
                 service.requestUserScan()
@@ -1985,69 +1961,130 @@ private struct ScanGlassCapsule: ViewModifier {
 }
 
 /// 扫描胶囊状态。ObservableObject：本机 SwiftUI 宏插件不可用，@State 编不过。
-/// 关键：**和菜单栏图标用同一个信号 service.userScanning** —— 只有用户主动扫描
-/// 才转菜单、走进度；菜单停，进度补到 100% 显示完成。后台静默检测不触发动画。
+/// 关键：**只由 service.userScanning 启动** —— 只有用户主动扫描才走进度、菜单呼吸。
+/// 结束时通过 sentryScanTailBegin/End 通知菜单栏：呼吸要跟进度条一起补满再停，
+/// 不能检测一结束就停（进度条还要匀速走好几秒）。后台静默检测不触发动画。
 private final class ScanPhase: ObservableObject {
     @Published var started: Date?
     @Published var finishedAt: Date?
     /// 菜单停下那一刻的进度，完成动画从这里补到 100%
     @Published var finishFrom: CGFloat = 0
+    /// 收尾淡出：补满并停留后置起，视图据此把蓝条淡出回空闲
+    @Published var fadingOut = false
     @Published var pressed = false
+    /// 真实检测进度（service.progress = 已完成数/总数）。不再推动显示，
+    /// 只用来兜底「检测真结束了但结束信号迟到/丢失」的情况。
+    @Published var real: CGFloat = 0
 
-    static let doneHold: TimeInterval = 1.0    // 100% 停留多久
-    static let doneAnim: TimeInterval = 0.30   // 补到 100% 的时长
+    /// 收尾三段：补满 → 停留 → 淡出。补满沿用扫描中的匀速速率（见 finishDuration），
+    /// 不再固定 0.45s 一把梭——那样从低值跳到 100% 会「蹦」。
+    static let doneHold: TimeInterval = 0.35   // 100% 停留
+    static let doneFade: TimeInterval = 0.25   // 淡出回空闲
+    /// 本次补满的时长：剩余量 / 匀速速率。不设上限——扫得快时进度条低，
+    /// 收尾仍按同一速率走完，全程匀速；只钳 0.15s 下限避免临门一脚太拖。
+    @Published private var finishDuration: TimeInterval = 0.45
+
+    /// 扫描中：全程匀速，单一速率，不再分「前段猛冲 / 后段爬行」。
+    /// 目标 13 秒左右匀速走到 95%（约 7.3%/s），真实进度只用来兜底，
+    /// 不让条在末尾几乎停住。封顶 95%——最后 5% 留给「检测真的结束」
+    /// 才补满，条绝不会自己先爬到 100% 卡住。
+    private static let scanCeiling: CGFloat = 0.95
+    private static let scanRate: CGFloat = 0.95 / 13   // 全程恒定 ≈ 7.3%/s
+    private static let slowRate: CGFloat = 0.003       // 到 95% 后兜底极慢爬行 0.3%/s
+    private static let softCap: CGFloat = 0.99         // 慢爬封顶，留最后一点给结束补满
+
+    /// 显示状态：只在 progress(at:) 里按帧演进，TimelineView 每帧调用它。
+    /// 不用 @Published —— TimelineView 自己每帧刷新，不需要发布触发重绘。
+    private var display: CGFloat = 0
+    private var lastNow: Date?
+    /// 真实进度已到 100% 的时刻：用来兜底检测结束信号迟到/丢失的情况
+    private var realFullSince: Date?
 
     /// checking 变化：true 开始、false 完成。跟菜单动画完全同一个源。
     func update(checking now: Bool) {
         if now, started == nil || finishedAt != nil {
-            // 新一轮开始：清掉上一轮残留
+            // 新一轮开始：清掉上一轮残留（含真实进度与匀速跟随状态）
             started = Date()
             finishedAt = nil
             finishFrom = 0
-        } else if !now, let started, finishedAt == nil {
-            // 菜单停了 = 真实检测结束：记下当前进度，接下来补到 100%
-            // 用和 progress() 同一个公式，别让完成瞬间进度跳一下
-            finishFrom = Self.running(elapsed: max(Date().timeIntervalSince(started), 0))
-            finishedAt = Date()
-            let gen = self.started
-            DispatchQueue.main.asyncAfter(deadline: .now() + Self.doneHold) { [weak self] in
-                guard let self, self.started == gen else { return }
-                self.started = nil
-                self.finishedAt = nil
-                self.finishFrom = 0
+            real = 0
+            display = 0
+            lastNow = nil
+            realFullSince = nil
+        } else if !now, finishedAt == nil, started != nil {
+            finish()
+        }
+    }
+
+    /// 检测结束：finishFrom 取当前显示值（不跳变），然后补满 → 停留 → 淡出 → 回空闲。
+    /// gen 守卫：期间又开了新一轮就放弃这次收尾，不会把新轮的进度清掉。
+    private func finish() {
+        guard finishedAt == nil else { return }
+        finishFrom = display
+        // 剩余量按同一个匀速速率换算成时长：不管检测多快结束，
+        // 收尾都沿用扫描段的速率走完，整条线从头到尾一个速度，不会蹦。
+        let remain = max(0, 1 - display)
+        finishDuration = max(TimeInterval(remain / Self.scanRate), 0.15)
+        finishedAt = Date()
+        // 通知菜单栏「收尾开始」：呼吸继续，直到补满+停留+淡出全结束再停。
+        NotificationCenter.default.post(name: .sentryScanTailBegin, object: nil)
+        let gen = started
+        DispatchQueue.main.asyncAfter(deadline: .now() + finishDuration + Self.doneHold) {
+            [weak self] in
+            guard let self, self.started == gen, self.finishedAt != nil else { return }
+            // 淡出由补满动画完成后的一个标记驱动（见 progress(at:)）
+            self.fadingOut = true
+        }
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + finishDuration + Self.doneHold + Self.doneFade
+        ) { [weak self] in
+            guard let self, self.started == gen else { return }
+            self.started = nil
+            self.finishedAt = nil
+            self.finishFrom = 0
+            self.fadingOut = false
+            self.realFullSince = nil
+            // 收尾彻底结束：菜单栏可以停呼吸、恢复静态图了。
+            NotificationCenter.default.post(name: .sentryScanTailEnd, object: nil)
+        }
+    }
+
+    /// TimelineView 每帧调用。扫描中匀速推进，完成后从 finishFrom 补到 100%。
+    /// 返回恒定在 0...1，绝不超过 100%。
+    func progress(at now: Date) -> CGFloat {
+        guard let started else { return 0 }
+        if let finishedAt {
+            // 补满走线性（匀速），和扫描段的速率观感一致；easeOut 会让收尾突然加速。
+            let t = min(max(now.timeIntervalSince(finishedAt) / finishDuration, 0), 1)
+            return min(1, finishFrom + (1 - finishFrom) * CGFloat(t))
+        }
+
+        // 帧间隔钳到 50ms：面板从后台切回来时别让一帧跳过一大截
+        let dt = lastNow.map { min(max(now.timeIntervalSince($0), 0), 0.05) } ?? 0
+        lastNow = now
+
+        // 全程匀速：固定速率推进，不看真实进度、不分段，前面不再冲。
+        // 到 95% 后若检测还没结束，转成极慢爬行（0.3%/s）封顶 99%，
+        // 让条始终在动，同时把最后一点留给「检测结束」的补满动画。
+        if display < Self.scanCeiling {
+            display = min(Self.scanCeiling, display + CGFloat(dt) * Self.scanRate)
+        } else {
+            display = min(Self.softCap, display + CGFloat(dt) * Self.slowRate)
+        }
+
+        // 兜底：真实进度已 100% 但结束信号迟到/丢失 → 0.6 秒后自己收尾，
+        // 绝不让条停在 95% 或满格死等。正常情况结束信号先到，这条不触发。
+        if real >= 1 {
+            if realFullSince == nil { realFullSince = now }
+            else if now.timeIntervalSince(realFullSince!) >= 0.6, finishedAt == nil {
+                // progress(at:) 在视图渲染期间被调用，不能同步改 @Published；
+                // 派到下一个 runloop 再收尾，避免「渲染中改状态」的警告/循环。
+                DispatchQueue.main.async { [weak self] in self?.finish() }
             }
         }
+        return min(Self.scanCeiling, display)
     }
 
-    /// 纯函数：进度由时间决定。未完成时平缓爬到 90%（不到顶）；
-    /// 完成后从 finishFrom 平滑补到 100%。返回恒定在 0...1，绝不超过 100%。
-    func progress(at now: Date) -> CGFloat {
-        guard let started = started else { return 0 }
-        return Self.value(at: now, started: started,
-                          finishedAt: finishedAt, from: finishFrom)
-    }
-
-    private static func value(at now: Date, started: Date,
-                              finishedAt: Date?, from: CGFloat) -> CGFloat {
-        if let finishedAt {
-            let t = min(max(now.timeIntervalSince(finishedAt) / doneAnim, 0), 1)
-            return min(1, from + (1 - from) * CGFloat(easeOut(t)))
-        }
-        return Self.running(elapsed: max(now.timeIntervalSince(started), 0))
-    }
-
-    /// 扫描中那段：线性 6 秒爬到 90%。真实全量检测 5~7 秒（菜单栏图标
-    /// 转 5~6 圈），进度条跟着这个节奏匀速走，观感才不会「扫一下就完了」。
-    /// 别用 1-exp(-t/2.2) 或 easeOut(t/4) —— 前两秒就冲到七八成，看着太快。
-    /// 6 秒后不再硬停在 90%：个别慢源会把一轮拖到 20 秒以上，封顶就视觉卡死，
-    /// 所以后期继续缓慢渐近逼近 99%（留最后一段给完成动画），既不卡住也不越界。
-    /// 完成态的起点也走这里，保证信号归零那一刻进度不跳变。
-    private static func running(elapsed: TimeInterval) -> CGFloat {
-        if elapsed <= 6 { return 0.90 * CGFloat(elapsed / 6.0) }
-        return CGFloat(0.90 + 0.09 * (1 - exp(-(elapsed - 6) / 8.0)))
-    }
-
-    private static func easeOut(_ x: Double) -> Double { 1 - pow(1 - x, 3) }
 }
 
 /// 按下反馈：把 isPressed 写回 phase，让胶囊底色和缩放跟手势一致。
@@ -2066,6 +2103,8 @@ private struct ScanPressStyle: ButtonStyle {
 ///  · 完成：checking=false（菜单停）立刻补到 100%，短暂停留后回空闲。
 private struct ScanCapsule: View {
     let checking: Bool
+    /// service.progress：真实完成比例，只做结束兜底，不推动显示速度
+    let real: CGFloat
     let width: CGFloat
     let hover: HoverBox
     let action: () -> Void
@@ -2082,8 +2121,10 @@ private struct ScanCapsule: View {
             // 同一个 p 同时喂给蓝条、数字、遮罩，三者永远一致；clamp 防止越界
             let raw = phase.progress(at: timeline.date)
             let p = min(max(raw, 0), 1)
-            let done = phase.finishedAt != nil
-            let label = done ? "100%" : (p > 0 ? "\(Int(p * 100))%" : "重新扫描")
+            // 文字和蓝条、遮罩共用同一个 p：补满阶段 p 还在匀速走，
+            // 数字就跟着涨；不能拿 finishedAt 当「已满」去写死 100%，
+            // 否则结束信号一到、条还没走完，数字先蹦到 100%。
+            let label = p > 0 ? "\(Int(p * 100))%" : "重新扫描"
 
             Button {
                 guard !checking else { return }
@@ -2097,33 +2138,39 @@ private struct ScanCapsule: View {
                         .animation(.easeOut(duration: 0.10), value: hover.on)
                         .animation(.easeOut(duration: 0.08), value: phase.pressed)
 
-                    // 蓝条：画一条和按钮完全同尺寸的整条胶囊，再用左对齐的矩形
-                    // 遮罩裁出左边 p 那一段。绝不「画一条宽度=p 的胶囊」——那样
-                    // p 很小时宽度小于高度，胶囊会缩成一个圆顶出上下边框，右端
-                    // 也跟着变圆，看起来就是蓝块超出按钮边框。整条胶囊 + 裁剪后，
-                    // 右端始终是圆头、上下永远贴着按钮边，低百分比也不会冒出去。
-                    Capsule()
-                        .fill(Color.accentColor)
-                        .frame(width: width, height: Self.height)
-                        .mask(alignment: .leading) {
-                            GeometryReader { g in
-                                Rectangle()
-                                    .frame(width: g.size.width * p, height: g.size.height)
+                    // 蓝条 + 白色数字：收尾淡出时一起淡掉，回空闲是滑出去不是硬切。
+                    ZStack(alignment: .leading) {
+                        // 蓝条：画一条和按钮完全同尺寸的整条胶囊，再用左对齐的矩形
+                        // 遮罩裁出左边 p 那一段。绝不「画一条宽度=p 的胶囊」——那样
+                        // p 很小时宽度小于高度，胶囊会缩成一个圆顶出上下边框，右端
+                        // 也跟着变圆，看起来就是蓝块超出按钮边框。整条胶囊 + 裁剪后，
+                        // 右端始终是圆头、上下永远贴着按钮边，低百分比也不会冒出去。
+                        Capsule()
+                            .fill(Color.accentColor)
+                            .frame(width: width, height: Self.height)
+                            .mask(alignment: .leading) {
+                                GeometryReader { g in
+                                    Rectangle()
+                                        .frame(width: g.size.width * p, height: g.size.height)
+                                }
                             }
-                        }
-                        .animation(nil, value: p)
+                            .animation(nil, value: p)
 
-                    // 内容两遍：深色打底 + 白色用同一块蓝条遮罩，视觉与进度一致
+                        capsuleContent(label: label)
+                            .foregroundStyle(Color.white)
+                            .mask(alignment: .leading) {
+                                GeometryReader { g in
+                                    Rectangle()
+                                        .frame(width: g.size.width * p, height: g.size.height)
+                                }
+                            }
+                    }
+                    .opacity(phase.fadingOut ? 0 : 1)
+                    .animation(.easeOut(duration: ScanPhase.doneFade), value: phase.fadingOut)
+
+                    // 深色打底：淡出后露出的「重新扫描」文字，始终在
                     capsuleContent(label: label)
                         .foregroundStyle(Color.primary)
-                    capsuleContent(label: label)
-                        .foregroundStyle(Color.white)
-                        .mask(alignment: .leading) {
-                            GeometryReader { g in
-                                Rectangle()
-                                    .frame(width: g.size.width * p, height: g.size.height)
-                            }
-                        }
                 }
                 .frame(width: width, height: Self.height)
                 .scaleEffect(phase.pressed ? 0.97 : 1)
@@ -2133,9 +2180,10 @@ private struct ScanCapsule: View {
             .contentShape(Capsule())
             .frame(width: width, height: Self.height)
         }
-        .onAppear { phase.update(checking: checking) }
+        .onAppear { phase.update(checking: checking); phase.real = real }
         .onHover { hover.on = $0 }
         .onChange(of: checking) { phase.update(checking: $0) }
+        .onChange(of: real) { phase.real = $0 }
         .modifier(ScanGlassCapsule())
     }
 
@@ -2487,44 +2535,35 @@ private struct PressablePlainButton: ButtonStyle {
     }
 }
 
-/// 图标交给 AppKit 自己画：缓存里那张图带浅色/深色两份表示，
-/// 系统换外观时这个 NSView 会收到回调重绘，AppKit 按当前外观挑对应那份。
-/// 之前用 SwiftUI 的 Image + colorScheme 取图，面板这套自建窗口里 body
-/// 不随外观重算，图标就一直停着，非要重启才换。
-private struct AppIcon: NSViewRepresentable {
-    let icons: AppIconPair
+/// 系统深浅色切换信号。
+///
+/// 可更新列表是 `List { ForEach }`，行视图会被复用缓存：系统外观切换时，别的面板里
+/// 的 SwiftUI Image 会慢半拍重绘，但列表行里的 Image 因为缓存既不重建也不换
+/// representation，表现就是「完全不变」。图标本身是未拍平的 NSImage（浅/深多套
+/// representation 都在），所以这里监听到系统外观广播就 +1，给行里的 Image 套
+/// `.id(version)` 强制重建——重建时 AppKit 会按新的 effectiveAppearance 选对那套。
+final class AppearanceSignal: ObservableObject {
+    static let shared = AppearanceSignal()
+    @Published private(set) var version: Int = 0
+    private var observer: NSObjectProtocol?
 
-    func makeNSView(context: Context) -> IconView {
-        let view = IconView()
-        view.icons = icons
-        return view
+    private init() {
+        // 系统深浅色切换是跨进程广播，必须监听 DistributedNotificationCenter；
+        // 进程内的 NotificationCenter.default 收不到。
+        observer = DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            // 通知可能先于 AppKit 更新 effectiveAppearance 到达，晚一拍再触发重建，
+            // 保证重建时拿到的是新外观对应的 representation（50ms，感知不到）。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                self?.version += 1
+            }
+        }
     }
 
-    func updateNSView(_ nsView: IconView, context: Context) {
-        nsView.icons = icons
-    }
-
-    final class IconView: NSView {
-        var icons: AppIconPair? {
-            didSet { needsDisplay = true }
-        }
-
-        override func viewDidChangeEffectiveAppearance() {
-            super.viewDidChangeEffectiveAppearance()
-            needsDisplay = true
-        }
-
-        override func draw(_ dirtyRect: NSRect) {
-            guard let icons else { return }
-            let dark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-            (dark ? icons.dark : icons.light).draw(in: bounds, from: .zero,
-                                                   operation: .sourceOver, fraction: 1,
-                                                   respectFlipped: true,
-                                                   hints: [.interpolation: NSImageInterpolation.high])
-        }
-
-        // 别挡住行里的点击
-        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    deinit {
+        if let observer { DistributedNotificationCenter.default().removeObserver(observer) }
     }
 }
 
@@ -2574,6 +2613,8 @@ struct RowView: View {
     let row: AppRow
     let service: UpdateService
     @ObservedObject var hover: HoverBox
+    /// 系统深浅色切换时强制行内图标重建（List 行复用会缓存住 Image）
+    @ObservedObject private var appearance = AppearanceSignal.shared
     /// 「展开全部」的状态（见 NotesBox 的说明）
     @ObservedObject private var notes = NotesBox.shared
     /// 本行说明文字的自然高度：量到后只重绘这一行，用来决定要不要给「展开全部」
@@ -2602,7 +2643,8 @@ struct RowView: View {
                 // 就把滚动尖峰从 60ms 抬到 150ms。点击行为不变，无障碍用
                 // accessibilityAction 补回来，VoiceOver 照样能「按」这一行。
                 HStack(alignment: .center, spacing: 10) {
-                    AppIcon(icons: row.app.icon)
+                    Image(nsImage: row.app.icon.light)
+                        .id(appearance.version)   // 系统深浅色切换时强制重建，绕过 List 行复用缓存
                         .frame(width: PanelMetrics.iconSide, height: PanelMetrics.iconSide)
 
                     VStack(alignment: .leading, spacing: 1) {

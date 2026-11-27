@@ -37,8 +37,8 @@ DEVELOPER_DIR="$CLT_DEV" swiftc -O -whole-module-optimization \
     "$SRC"/*.swift
 
 echo "▸ 图标（Icon Composer 图层包：圆环 + 箭头，白天白底黑图 / 暗夜黑底白图）"
-ICON_DOC="$ROOT/Resources/AppIcon37.icon"     # 设计源文件（6 个 SVG + icon.json，可用 Icon Composer 打开改）
-                                            # 名字带 26 是故意的：换图标名可以让系统的图标缓存重新取图，
+ICON_DOC="$ROOT/Resources/AppIcon37.icon"     # 设计源文件（日夜两张 mark SVG + icon.json，可用 Icon Composer 打开改）
+                                            # 名字带编号是为了换图标名能让系统的图标缓存重新取图，
                                             # 不然 Finder/Dock 会一直显示旧图标（系统缓存目录属 root，删不掉）
 ICON_PKG="$BUILD/AppIcon37.icon"             # actool 只认这个位置，换路径会静默不产出
                                              # 图标只有一条路：Resources/AppIcon37.icon → actool → Assets.car。
@@ -74,7 +74,7 @@ if [ -f "$ICON_DOC/icon.json" ]; then
         exit 1
     fi
 else
-    echo "  ✗ 没找到 Resources/AppIcon.icon（图标唯一的来源），先找回它再继续。"
+    echo "  ✗ 没找到 Resources/AppIcon37.icon（图标唯一的来源），先找回它再继续。"
     exit 1
 fi
 

@@ -230,7 +230,9 @@ struct AppRow: Identifiable {
 }
 
 
-/// 一个 App 的浅色、深色两套图标。有些 App 只提供一套，两份就一样。
+/// 一个 App 的图标。NSWorkspace 返回的 NSImage 里自带浅色/深色多套 representation，
+/// 交给 AppKit 在绘制时按当前外观自动选，所以这里只存一份（字段名沿用 light/dark，
+/// 两个都指向同一张未拍平的图）。
 struct AppIconPair {
     let light: NSImage
     let dark: NSImage
@@ -255,11 +257,14 @@ final class IconCache {
         if let hit = cache[path], hit.stamp == stamp { lock.unlock(); return hit.icons }
         lock.unlock()
 
-        // 列表里只画到 40pt，没必要留着 512px 的原始位图：
-        // 直接光栅化到 64×64 像素，一张 16KB 而不是几百 KB
+        // 不拍平。NSWorkspace 的图标里带着浅色/深色多套 representation，
+        // 拍平成位图会把外观钉死在取图那一刻，切系统深浅色就不会变。
+        // 照 Sidle 的做法：copy 一份（别污染 NSWorkspace 的共享缓存），只改 size，
+        // 让 AppKit 在每次绘制时按当前外观自动选 representation。
         let src = NSWorkspace.shared.icon(forFile: path)
-        let icons = AppIconPair(light: IconCache.rasterize(src, pixels: 64, dark: false),
-                                dark: IconCache.rasterize(src, pixels: 64, dark: true))
+        let copied = (src.copy() as? NSImage) ?? src
+        copied.size = NSSize(width: 40, height: 40)
+        let icons = AppIconPair(light: copied, dark: copied)
 
         lock.lock()
         cache[path] = Entry(icons: icons, stamp: stamp)
@@ -286,36 +291,6 @@ final class IconCache {
         }
     }
 
-    /// 光栅化成 64px 的位图，按目标外观单独取一遍：
-    /// 光栅化会把图标「拍平」，不按外观取图的话深浅色切了也不会变。
-    private static func rasterize(_ src: NSImage, pixels: Int, dark: Bool) -> NSImage {
-        let size = NSSize(width: pixels / 2, height: pixels / 2)
-        guard let rep = NSBitmapImageRep(
-            bitmapDataPlanes: nil, pixelsWide: pixels, pixelsHigh: pixels,
-            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
-        ) else { return src }
-
-        rep.size = size
-        NSGraphicsContext.saveGraphicsState()
-        if let ctx = NSGraphicsContext(bitmapImageRep: rep) {
-            NSGraphicsContext.current = ctx
-            ctx.imageInterpolation = .high
-            let rect = NSRect(origin: .zero, size: size)
-            if let appearance = NSAppearance(named: dark ? .darkAqua : .aqua) {
-                appearance.performAsCurrentDrawingAppearance {
-                    src.draw(in: rect)
-                }
-            } else {
-                src.draw(in: rect)
-            }
-        }
-        NSGraphicsContext.restoreGraphicsState()
-
-        let out = NSImage(size: size)
-        out.addRepresentation(rep)
-        return out
-    }
 }
 
 // MARK: - 面板尺寸（一处定义，列表行高由它推出来）

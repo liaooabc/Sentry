@@ -574,12 +574,6 @@ enum Cask {
         let homepage: String?
     }
 
-    /// 只在设了 UR_DEBUG_CASK 时往 stderr 打一行，正常使用零开销
-    static func debugLog(_ line: String) {
-        guard ProcessInfo.processInfo.environment["UR_DEBUG_CASK"] != nil else { return }
-        FileHandle.standardError.write(("[cask] " + line + "\n").data(using: .utf8)!)
-    }
-
     private static let lock = NSLock()
     private static var store: [String: Cached]?
     private static var mapLoaded = false
@@ -604,12 +598,10 @@ enum Cask {
         guard let url = Bundle.main.url(forResource: "cask-map", withExtension: "json"),
               let data = try? Data(contentsOf: url),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            debugLog("loadMap 失败：找不到或读不了 cask-map.json（Bundle=\(Bundle.main.bundlePath)）")
             return
         }
         nameMap = obj["apps"] as? [String: String] ?? [:]
         bundleMap = obj["bundles"] as? [String: String] ?? [:]
-        debugLog("loadMap 完成：apps=\(nameMap.count) bundles=\(bundleMap.count)")
     }
 
     /// 一个 App 对应哪个 cask：先按 .app 文件名，再按 bundle id
@@ -714,14 +706,8 @@ enum Cask {
     }
 
     static func lookup(_ app: InstalledApp, force: Bool = false) async -> Entry? {
-        guard let hit = token(for: app) else {
-            debugLog("\(app.name)：没有 cask 映射")
-            return nil
-        }
-        guard let c = await fetch(hit.token, force: force) else {
-            debugLog("\(app.name)：拉取 cask \(hit.token) 失败")
-            return nil
-        }
+        guard let hit = token(for: app) else { return nil }
+        guard let c = await fetch(hit.token, force: force) else { return nil }
         // 只按文件名对上的，再用 cask 登记的 bundle id 复核一次：
         // 本机装的是 Telegram Desktop（com.tdesktop.Telegram），cask 里是原生版（ru.keepcoder.Telegram），名字一样但不是同一个 App
         if !hit.exact, let ids = c.bundles, !ids.isEmpty, let bid = app.bundleId, !ids.contains(bid) {

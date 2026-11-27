@@ -20,7 +20,8 @@ final class PanelWindow: NSPanel {
     }
 }
 
-/// 菜单栏图标的三种取法：完整静态图，或扫描动画拆出的箭头层 / 环+点层。
+/// 菜单栏图标的取法：完整静态图，或扫描动画用的 UD 圆图层。
+/// .arrow 是旧「环+箭头」动画遗留的空图，保留仅为兼容，不再参与动画。
 enum StatusIconPart {
     case full, arrow, ringDots
 }
@@ -47,12 +48,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 所以「点图标」不能被当成「点别处」：应用失活、全局点击两条收起路径都要放行。
     private var statusItemRect: NSRect = .zero
 
-    // 扫描时：箭头那层不动，「开口环 + 三个点」整层绕中心转（加载效果）。
-    // 缺口和点一起转，点始终待在缺口里，不会转到环上融进去。
+    // 扫描时：UD 圆保持正立，只做明暗呼吸（字母始终可读，不晕）。
     private var scanAnimating = false
-    private var arrowLayer: CALayer?
-    private var ringLayer: CALayer?
-    private static let spinPeriod: CFTimeInterval = 1.1    // 转一圈
+    private var markLayer: CALayer?
+    private static let pulsePeriod: CFTimeInterval = 0.65  // 半程；一呼一吸约 1.3s
+    /// 进度条收尾中：检测已结束、但蓝条还在匀速补满/停留/淡出。
+    /// 这段时间呼吸必须继续，等收尾结束通知再停，才和进度条同步。
+    private var scanTailActive = false
+    private var tailBeginObserver: NSObjectProtocol?
+    private var tailEndObserver: NSObjectProtocol?
+    /// userScanning=false 后延迟一拍再停，给收尾开始通知一个到达的机会
+    /// （两个信号谁先到不保证）；面板没开、没有进度条时这一拍后照常停。
+    private var pendingScanStop: DispatchWorkItem?
 
     private let panelSize = NSSize(width: PanelMetrics.width, height: PanelMetrics.height)
     /// NSPopover 的 contentSize 就是整块玻璃的大小，内容直接铺满；
@@ -96,33 +103,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // 调试用：SENTRY_SCAN_NOW=1 时启动就强制全量重扫。
-        // 正常启动只在结果过期（设置里的间隔小时数）时才查，验证新检测源时等不起。
-        if debugValue("SENTRY_SCAN_NOW") == "1" {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
-                self?.service.checkAll(force: true)
-            }
-        }
-
-        // 调试用：UR_SCROLL_TEST=1 时面板弹出来后自己把列表滚一遍，量滚动掉帧。
-        // 用外部合成滚轮事件驱动面板很容易被真实点击打断，让 App 自己滚自己的
-        // 列表最稳：同一套 SwiftUI 布局、同一套 List，量到的就是用户滚时的开销。
-        if debugValue("UR_SCROLL_TEST") == "1" {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-                self?.runScrollTest()
-            }
-        }
-
-        // 调试用：SENTRY_TEST_NOTIFY=1 时启动 3 秒后发一条测试通知，
-        // 排查「开关开着但收不到」到底是授权、投递还是展示的问题。
-        if debugValue("SENTRY_TEST_NOTIFY") == "1" {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-                Notifier.shared.post(title: "Sentry 测试通知",
-                                     body: "能看到这条，说明通知链路是通的。",
-                                     id: "sentry.test.\(Int(Date().timeIntervalSince1970))")
-            }
-        }
-
         // 首次安装先看引导：通知授权放在引导里，不让系统授权框抢在欢迎窗口前面弹出来
         if OnboardingWindow.isNeeded {
             Notifier.shared.prepare()
@@ -148,9 +128,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .receive(on: RunLoop.main)
             .sink { [weak self] scanning in
                 Task { @MainActor in
-                    if scanning { self?.startScanAnimation() } else { self?.stopScanAnimation() }
+                    guard let self else { return }
+                    if scanning {
+                        self.pendingScanStop?.cancel()
+                        self.pendingScanStop = nil
+                        self.startScanAnimation()
+                    } else {
+                        // 检测结束不等于动画结束：进度条还要匀速补满。
+                        // 延迟一拍再停，让「收尾开始」通知先到；真在收尾就别停。
+                        let work = DispatchWorkItem { [weak self] in
+                            Task { @MainActor in
+                                guard let self, !self.scanTailActive else { return }
+                                self.stopScanAnimation()
+                            }
+                        }
+                        self.pendingScanStop = work
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: work)
+                    }
                 }
             }
+
+        // 进度条收尾开始/结束：呼吸跟着蓝条一起走完，而不是检测一停就停。
+        tailBeginObserver = NotificationCenter.default.addObserver(
+            forName: .sentryScanTailBegin, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.scanTailActive = true
+                self.pendingScanStop?.cancel()
+                self.pendingScanStop = nil
+                self.startScanAnimation()
+            }
+        }
+        tailEndObserver = NotificationCenter.default.addObserver(
+            forName: .sentryScanTailEnd, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.scanTailActive = false
+                self.stopScanAnimation()
+            }
+        }
 
         // 后台查完就刷新角标/图标，不用等用户点一下
         cancellable = service.$updateCount
@@ -402,111 +420,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateBadge()
     }
 
-    // MARK: - 调试：自动滚动量帧
-
-    private var scrollTestTimer: Timer?
-
-    /// 依次把面板里每个 List 用 60Hz 合成滚轮滚 1.8 秒，量滚动掉帧。
-    /// 用 NSScrollView.scrollWheel 走真实滚动通路（clipView.scroll(to:) 对
-    /// ListCore 的虚拟化文档高度无效，只会滚几十像素）。
-    ///
-    /// 帧耗时口径跟人工测的一致：60Hz Timer 相邻两次 tick 的实际间隔就是主线程的
-    /// 一帧（Timer 被主线程的活拖慢多少，间隔就多长）。每 0.5s 汇总一次
-    /// 「窗口内最长单帧 + >20ms 的掉帧次数」，整轮结束再报一次全局最长单帧。
-    private func runScrollTest() {
-        guard let panel, panel.isVisible else { writeScrollTest("panel-not-visible"); return }
-        // 每轮重测都从头记
-        try? FileManager.default.removeItem(atPath: "/tmp/scrolltest.log")
-        var views: [NSScrollView] = []
-        func walk(_ v: NSView) {
-            if let sv = v as? NSScrollView { views.append(sv) }
-            for sub in v.subviews { walk(sub) }
-        }
-        if let cv = panel.contentView { walk(cv) }
-        guard !views.isEmpty else { writeScrollTest("no-scrollview"); return }
-
-        var index = 0
-        var elapsed: TimeInterval = 0
-        var markPending = true
-        writeScrollTest("lists=" + views.map { String(Int($0.documentView?.bounds.height ?? -1)) }.joined(separator: ","))
-
-        // 帧耗时统计
-        var lastTick = CACurrentMediaTime()
-        var winStart = lastTick
-        var winMax = 0.0
-        var winDrops = 0
-        var winFrames = 0
-        var globalMax = 0.0
-        var globalDrops = 0
-
-        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] timer in
-            MainActor.assumeIsolated {
-                guard let self else { timer.invalidate(); return }
-
-                // 先量上一帧到现在过了多久（这就是主线程这一帧的耗时）
-                let now = CACurrentMediaTime()
-                let gap = now - lastTick
-                lastTick = now
-                winMax = max(winMax, gap)
-                winFrames += 1
-                globalMax = max(globalMax, gap)
-                if gap > 0.020 { winDrops += 1; globalDrops += 1 }
-                if now - winStart >= 0.5 {
-                    self.writeScrollTest(String(format: "win list%d frames=%d max=%.0fms drops=%d",
-                                                min(index, views.count - 1), winFrames, winMax * 1000, winDrops))
-                    winStart = now; winMax = 0; winDrops = 0; winFrames = 0
-                }
-
-                if index >= views.count {
-                    timer.invalidate()
-                    self.scrollTestTimer = nil
-                    self.writeScrollTest(String(format: "end globalMax=%.0fms globalDrops=%d", globalMax * 1000, globalDrops))
-                    // 量完自己收起面板并退出，不留在屏幕上打扰人
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                        self?.hidePanel()
-                    }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                        NSApp.terminate(nil)
-                    }
-                    return
-                }
-                let sv = views[index]
-                if markPending {
-                    markPending = false
-                    self.writeScrollTest("list\(index) start doc=\(Int(sv.documentView?.bounds.height ?? -1)) y=\(Int(sv.contentView.bounds.origin.y))")
-                }
-                if let cg = CGEvent(scrollWheelEvent2Source: nil, units: .pixel,
-                                    wheelCount: 1, wheel1: -24, wheel2: 0, wheel3: 0),
-                   let ev = NSEvent(cgEvent: cg) {
-                    sv.scrollWheel(with: ev)
-                }
-                elapsed += 1.0 / 60.0
-                if elapsed >= 1.8 {
-                    self.writeScrollTest("list\(index) end doc=\(Int(sv.documentView?.bounds.height ?? -1)) y=\(Int(sv.contentView.bounds.origin.y))")
-                    index += 1
-                    elapsed = 0
-                    markPending = true
-                }
-            }
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        scrollTestTimer = timer
-    }
-
-    private func writeScrollTest(_ s: String) {
-        // 追加写：一轮测试要留多行（每 0.5s 一行 + 首尾），覆盖写就只剩最后一行
-        let line = "scrolltest \(s)\n"
-        let path = "/tmp/scrolltest.log"
-        guard let data = line.data(using: .utf8) else { return }
-        if let fh = FileHandle(forWritingAtPath: path) {
-            fh.seekToEndOfFile()
-            fh.write(data)
-            try? fh.close()
-        } else {
-            try? data.write(to: URL(fileURLWithPath: path))
-        }
-    }
-
     // MARK: - 面板键盘
 
     /// 只挂本地监视器：面板是 key window 时接管 ↑↓ / Return / Esc，其它情况原样放行。
@@ -605,7 +518,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 有没有新版本看角标数字就够了（2026-11-21）。
     }
 
-    // MARK: - 扫描时三个点沿环转
+    // MARK: - 扫描时的明暗呼吸
 
     /// 模板图是「黑剪影 + alpha」，塞进 CALayer 不会跟菜单栏明暗走，
     /// 所以按当前外观染一份再交给图层。
@@ -643,8 +556,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return img
     }
 
-    /// 扫描时的加载动画：拆成两层——箭头不动，「开口环 + 三个点」整层绕中心转。
-    /// 因为缺口和点是一体的，点始终待在缺口里，转到哪都看得见；箭头保持朝下。
+    /// 扫描时的加载动画：UD 圆保持正立，只做明暗呼吸。
+    /// 字母有方向性，转起来会倒过来、识别度全丢；呼吸是最克制的「正在工作」反馈。
     private func startScanAnimation() {
         guard !scanAnimating, let button = statusItem.button else { return }
         scanAnimating = true
@@ -661,50 +574,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             rect = cell.imageRect(forBounds: button.bounds)
         }
 
-        func imageLayer(_ part: StatusIconPart) -> CALayer {
-            let l = CALayer()
-            l.frame = rect
-            l.contentsGravity = .resizeAspect
-            l.contentsScale = scale
-            l.contents = tintedCGImage(makeStatusIcon(part), color: color, scale: scale)
-            button.layer?.addSublayer(l)
-            return l
-        }
+        let mark = CALayer()
+        mark.frame = rect
+        mark.contentsGravity = .resizeAspect
+        mark.contentsScale = scale
+        mark.contents = tintedCGImage(makeStatusIcon(.ringDots), color: color, scale: scale)
+        button.layer?.addSublayer(mark)
+        markLayer = mark
 
-        // 箭头：静止层，压在环下面
-        arrowLayer = imageLayer(.arrow)
-        // 环 + 三点：整层旋转（初始角度与静态图一致，切换不跳变）
-        let ring = imageLayer(.ringDots)
-        ringLayer = ring
-
-        let spin = CABasicAnimation(keyPath: "transform.rotation.z")
-        spin.fromValue = 0
-        spin.toValue = 2 * CGFloat.pi
-        spin.duration = Self.spinPeriod
-        spin.repeatCount = .infinity
-        spin.isRemovedOnCompletion = false
-        // 每圈「快起慢收」：一上来就冲出去，接近转满一圈、三点快回到原位时明显减速，
-        // 下一圈再从 0 重新冲。timingFunction 会在每次循环迭代都重新应用，
-        // 所以这个节奏会一圈一圈重复，而不是匀速转。
-        // 控制点 (0.12, 0.72, 0.28, 1)：起步切线很陡（快），末段趋平（慢）。
-        spin.timingFunction = CAMediaTimingFunction(controlPoints: 0.12, 0.72, 0.28, 1.0)
-        ring.add(spin, forKey: "spin")
+        // 一呼一吸：1.0 → 0.35 → 1.0，ease-in-out，约 1.3s 一个周期。
+        let pulse = CABasicAnimation(keyPath: "opacity")
+        pulse.fromValue = 1.0
+        pulse.toValue = 0.35
+        pulse.duration = Self.pulsePeriod
+        pulse.autoreverses = true
+        pulse.repeatCount = .infinity
+        pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        mark.add(pulse, forKey: "pulse")
     }
 
     private func stopScanAnimation() {
         guard scanAnimating else { return }
         scanAnimating = false
-        for layer in [ringLayer, arrowLayer].compactMap({ $0 }) {
-            layer.removeAllAnimations()
-            layer.removeFromSuperlayer()
-        }
-        ringLayer = nil
-        arrowLayer = nil
+        markLayer?.removeAllAnimations()
+        markLayer?.removeFromSuperlayer()
+        markLayer = nil
         statusItem.button?.image = makeStatusIcon()
     }
 
-    /// 菜单栏图标：模板图（开口环 + 三个点 + 箭头）。走 template 渲染，
-    /// 系统按菜单栏明暗自动反色。扫描动画把箭头和「环+点」拆成两层分别取。
+    /// 菜单栏图标：UD 圆模板图。走 template 渲染，系统按菜单栏明暗自动反色。
+    /// 扫描动画只取 UD 圆一层做明暗呼吸，不再拆环/箭头。
     private func makeStatusIcon(_ part: StatusIconPart = .full) -> NSImage {
         // 优先用 asset catalog 里的矢量模板图，任意缩放都清晰，设计师能直接改。
         // 三张 SVG 几何完全一致，叠起来就是完整图标：

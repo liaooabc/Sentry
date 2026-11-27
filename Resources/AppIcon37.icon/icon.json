@@ -1,95 +1,50 @@
 {
-  "fill": "system-light",
+  "fill-specializations": [
+    {
+      "value": {
+        "linear-gradient": [
+          "extended-srgb:0.98824,0.98824,0.99608,1.00000",
+          "extended-srgb:0.90980,0.92157,0.94510,1.00000"
+        ]
+      }
+    },
+    {
+      "appearance": "dark",
+      "value": {
+        "linear-gradient": [
+          "extended-srgb:0.11373,0.11765,0.13333,1.00000",
+          "extended-srgb:0.03922,0.03922,0.04706,1.00000"
+        ]
+      }
+    }
+  ],
   "groups": [
     {
       "layers": [
         {
-          "image-name": "20-arrow-day.svg",
-          "name": "2_Arrow_Day",
+          "image-name": "10-mark-day.svg",
+          "name": "Mark_Day",
+          "is-glass": true,
           "opacity-specializations": [
-            {
-              "appearance": "dark",
-              "value": 0.0
-            },
-            {
-              "appearance": "tinted",
-              "value": 0.0
-            }
+            { "appearance": "dark", "value": 0.0 }
           ]
         },
         {
-          "image-name": "20-arrow-night.svg",
-          "name": "2_Arrow_Night",
+          "image-name": "10-mark-night.svg",
+          "name": "Mark_Night",
+          "is-glass": true,
           "opacity-specializations": [
-            {
-              "appearance": "light",
-              "value": 0.0
-            }
+            { "appearance": "light", "value": 0.0 }
           ]
         }
-      ]
-    },
-    {
-      "layers": [
-        {
-          "image-name": "10-ring-day.svg",
-          "name": "1_Ring_Day",
-          "opacity-specializations": [
-            {
-              "appearance": "dark",
-              "value": 0.0
-            },
-            {
-              "appearance": "tinted",
-              "value": 0.0
-            }
-          ]
-        },
-        {
-          "image-name": "10-ring-night.svg",
-          "name": "1_Ring_Night",
-          "opacity-specializations": [
-            {
-              "appearance": "light",
-              "value": 0.0
-            }
-          ]
-        }
-      ]
-    },
-    {
-      "layers": [
-        {
-          "image-name": "00-bg-day.svg",
-          "name": "0_Bg_Day",
-          "opacity-specializations": [
-            {
-              "appearance": "dark",
-              "value": 0.0
-            },
-            {
-              "appearance": "tinted",
-              "value": 0.0
-            }
-          ]
-        },
-        {
-          "image-name": "00-bg-night.svg",
-          "name": "0_Bg_Night",
-          "opacity-specializations": [
-            {
-              "appearance": "light",
-              "value": 0.0
-            }
-          ]
-        }
-      ]
+      ],
+      "shadow": { "kind": "neutral", "opacity": 0.5 },
+      "translucency": { "enabled": true, "value": 0.35 },
+      "specular": { "enabled": true, "value": 0.5 }
     }
   ],
   "supported-platforms": {
-    "circles": [
-      "watchOS"
-    ],
+    "circles": ["watchOS"],
     "squares": "shared"
   }
 }
